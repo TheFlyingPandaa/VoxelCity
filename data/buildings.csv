@@ -1,0 +1,14 @@
+# Version 1: cost,upkeep,capacity,unlock population,road coverage radius
+# Residential, commercial, industrial, power, water, sewage, garbage, clinic, fire, police, school, park
+0,0,8,0,0
+0,0,6,0,0
+0,0,10,0,0
+2500,30,2000,0,0
+1800,20,2000,0,0
+2200,25,2000,0,0
+1800,15,2000,500,80
+2000,15,2000,500,64
+2000,15,2000,500,80
+1800,15,2000,2000,64
+2200,20,2000,2000,64
+500,5,2000,500,40
