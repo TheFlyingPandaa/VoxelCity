@@ -1,5 +1,7 @@
 #include "NetworkWorker.h"
 #include "City.h"
+#include "LegacyCityFixture.h"
+#include "Binary.h"
 #include <algorithm>
 #include <chrono>
 #include <fstream>
@@ -47,7 +49,13 @@ int main()try {
     for(int i=0;i<15000&&city.stats().deliveries==0;++i)city.tick(*w,traffic);CHECK(city.stats().deliveries>0);
     // Old v3 city payloads remain readable without injecting a highway into saved layouts.
     auto legacyWorld=std::make_unique<World>();CitySimulation legacy;TrafficSimulation legacyTraffic({0,42,20000,64,true});legacy.save(*legacyWorld,legacyTraffic,save);
-    {std::fstream file(save,std::ios::binary|std::ios::in|std::ios::out);file.seekp(4);const char version[4]={3,0,0,0};file.write(version,4);}
+    {std::ifstream file(save,std::ios::binary);std::string bytes{std::istreambuf_iterator<char>(file),{}};file.close();
+     // v3 predates the trailing vegetation block; update length and checksum too.
+     std::string payload=preRailPayload(bytes,*legacyWorld,legacy);payload.resize(payload.size()-8-MapSize*MapSize/8);
+     uint32_t checksum=2166136261u;for(unsigned char c:payload){checksum^=c;checksum*=16777619u;}
+     std::ofstream old(save,std::ios::binary|std::ios::trunc);
+     for(uint32_t v:{0x59544356u,3u,uint32_t(MapSize),uint32_t(MapSize),uint32_t(TileSize),checksum})binary::write(old,v);
+     binary::write(old,uint64_t(payload.size()));old.write(payload.data(),payload.size());}
     restored.load(*restoredWorld,restoredTraffic,save);CHECK(restoredWorld->highwayCount()==0);CHECK(restoredWorld->roadCount()==0);
     std::cout<<"Highway tests passed: protected geometry, limited access, speed, four trade routes, imports, active-trip persistence and v3 compatibility\n";
     return 0;

@@ -102,10 +102,11 @@ struct Options {
     uint32_t trafficSeed=std::random_device{}();
     bool trafficBenchmark=false,cityMode=true,cityInput=false;
     int cityScenario=-1,cityStress=0,citySpeed=1,quality=2;
-    bool threadingTest=false;
+    bool threadingTest=false,railwayScenario=false;
     bool voxels=true,cameraPath=false,noUI=false,noGrid=false;
     bool debug=false,benchmark=false,overview=false,edit=false,windowTest=false,interactionTest=false,closeUp=false,noShadows=false;
     unsigned width=1600,height=900;
+    std::optional<Camera> captureCamera;
     std::filesystem::path capture,report,captureSequence;
 };
 static Options options() {
@@ -114,10 +115,21 @@ static Options options() {
         std::wstring a=args[i];
         auto next=[&]()->std::wstring {if(i+1>=count) throw std::runtime_error("Missing command line option value.");return args[++i];};
         if(a==L"--city-input-test") {o.cityInput=true;o.cityMode=true;o.frames=90;}
+        else if(a==L"--railway-scenario") {o.railwayScenario=true;o.cityMode=true;}
         else if(a==L"--threading-test") {o.threadingTest=true;o.cityInput=true;o.cityMode=true;o.frames=90;}
         else if(a==L"--renderer") {auto v=next();if(v!=L"voxel"&&v!=L"legacy")throw std::runtime_error("Renderer must be voxel or legacy");o.voxels=v==L"voxel";}
         else if(a==L"--quality") {auto v=next();o.quality=v==L"low"?0:v==L"medium"?1:v==L"high"?2:-1;if(o.quality<0)throw std::runtime_error("Quality must be low, medium or high");}
         else if(a==L"--camera-path") o.cameraPath=true;
+        else if(a==L"--camera-view") {
+            Camera c;c.focus.x=std::stof(next());c.focus.y=std::stof(next());c.focus.z=std::stof(next());
+            c.yaw=std::stof(next());c.pitch=std::stof(next());c.distance=std::stof(next());
+            if(!std::isfinite(c.focus.x)||!std::isfinite(c.focus.y)||!std::isfinite(c.focus.z)||
+               !std::isfinite(c.yaw)||!std::isfinite(c.pitch)||!std::isfinite(c.distance)||
+               c.focus.x<0||c.focus.x>WorldSize||c.focus.z<0||c.focus.z>WorldSize||
+               c.pitch<.25f||c.pitch>1.48f||c.distance<18||c.distance>WorldSize*1.91f)
+                throw std::runtime_error("Invalid camera view: use world focus XYZ, yaw/pitch radians and distance within camera limits.");
+            o.captureCamera=c;
+        }
         else if(a==L"--no-ui") o.noUI=true;
         else if(a==L"--no-grid") o.noGrid=true;
         else if(a==L"--debug-layer") o.debug=true;
@@ -167,10 +179,12 @@ int run(HINSTANCE instance) {
     wchar_t executable[32768]{};GetModuleFileNameW(nullptr,executable,32768);
     auto dataPath=std::filesystem::path(executable).parent_path()/"data"/"buildings.csv";
     if(config.cityMode)city.loadDefinitions(dataPath);
-    if(config.cityMode){if(config.cityScenario>=0)city.scenario(*world,traffic,config.cityScenario);else city.newCity(*world,traffic);}
+    if(config.cityMode){if(config.railwayScenario)city.railwayScenario(*world,traffic);else if(config.cityScenario>=0)city.scenario(*world,traffic,config.cityScenario);else city.newCity(*world,traffic);}
     const size_t startingRoadCount=world->roadCount();
     if(config.cityStress)city.prepareTrafficStress(*world);city.speed=config.citySpeed;
-    int cityTool=0,ruleDirection=0,overlay=0;bool signal=false,showBudget=false,guide=true;
+    constexpr int ToolBulldoze=100,ToolRoadRule=101,ToolRoundabout=102,ToolInterchange=103,ToolRail=104,ToolRailOverpass=105;
+    int railRotation=0;
+    int cityTool=0,ruleDirection=0,overlay=0;RoadClass selectedRoad=RoadClass::Street;bool signal=false,showBudget=false,guide=true;
     ImVec2 residentialButton{},powerButton{},roadButton{};
     if(config.cityInput){city.paused=true;ImGui::GetIO().ConfigInputTrickleEventQueue=false;}
     Cell selected{};uint64_t savedRevision=city.revision;
@@ -187,6 +201,8 @@ int run(HINSTANCE instance) {
     if(config.cityMode&&config.cityScenario>=0){camera.focus={248.f*TileSize,0,225.f*TileSize};camera.distance=TileSize*45;}
     if(config.overview){camera.focus={WorldSize/2.f,0,WorldSize/2.f};camera.distance=WorldSize*1.86f;}
     else if(config.closeUp)camera.distance=TileSize*8.125f;
+    if(config.railwayScenario){camera.focus={248.f*TileSize,0,208.f*TileSize};camera.distance=TileSize*43;}
+    if(config.captureCamera)camera=*config.captureCamera;
     if(config.interactionTest) ImGui::GetIO().ConfigInputTrickleEventQueue=false;
     bool grid=!config.noGrid&&!config.voxels,shadows=!config.noShadows,vsync=!config.benchmark,diagnostics=config.benchmark,unsaved=false;
     Cell roadStart{};Cell previous{};int previousButton=-1;std::string status="Ready to build. Drag a line and release to build your first road.";
@@ -228,18 +244,21 @@ int run(HINSTANCE instance) {
         if(button>=0 && hover.x>=0 && !io.MouseDown[2]) {
             Cell from=previous.x>=0&&previousButton==button?previous:hover;
             if(config.cityMode){
-                if(button==1||cityTool==13){if(hover!=previous||button!=previousButton)city.bulldoze(*world,hover,status);}
-                else if(cityTool==0){if(ImGui::IsMouseClicked(0))roadStart=hover;}
-                else if(cityTool==15){if(ImGui::IsMouseClicked(0))city.buildRoundabout(*world,hover,status);}
+                if(button==1||cityTool==ToolBulldoze){if(hover!=previous||button!=previousButton){if(cityTool==0&&world->road(hover.x,hover.z)&&world->hasRail(hover)&&!city.at(hover))city.buildRoad(*world,hover,hover,true,status);else city.bulldoze(*world,hover,status);}}
+                else if(cityTool==0||cityTool==ToolRail){if(ImGui::IsMouseClicked(0))roadStart=hover;}
+                else if(cityTool==ToolRailOverpass){if(ImGui::IsMouseClicked(0))city.buildRailOverpass(*world,hover,status);}
+                else if(cityTool>0&&cityTool<int(BuildingKind::Count)&&railFacility(BuildingKind(cityTool))){if(ImGui::IsMouseClicked(0))city.placeRailFacility(*world,hover,BuildingKind(cityTool),railRotation,status);}
+                else if(cityTool==ToolRoundabout){if(ImGui::IsMouseClicked(0))city.buildRoundabout(*world,hover,status);}
+                else if(cityTool==ToolInterchange){if(ImGui::IsMouseClicked(0))city.buildDiamondInterchange(*world,hover,status);}
                 else if(cityTool==-1)selected=hover;
-                else if(cityTool==14)city.roadRule(*world,hover,uint8_t(ruleDirection|(signal?8:0)),status);
+                else if(cityTool==ToolRoadRule)city.roadRule(*world,hover,uint8_t(ruleDirection|(signal?8:0)),status);
                 else {Cell c=from;city.place(*world,c,BuildingKind(cityTool),status);while(c!=hover){if(c.x!=hover.x)c.x+=hover.x>c.x?1:-1;else c.z+=hover.z>c.z?1:-1;city.place(*world,c,BuildingKind(cityTool),status);}}
                 unsaved=city.revision!=savedRevision;
             } else {size_t before=world->roadCount();world->stroke(from,hover,button==0);unsaved|=before!=world->roadCount();}
             previous=hover;previousButton=button;
         } else {previous={};previousButton=-1;}
-        if(cityTool!=0||!app.active||io.MouseDown[1]||io.MouseDown[2]||ImGui::IsKeyPressed(ImGuiKey_Escape))roadStart={};
-        if(config.cityMode&&cityTool==0&&ImGui::IsMouseReleased(0)&&roadStart.x>=0){if(hover.x>=0)city.buildDiagonalRoad(*world,roadStart,hover,status);roadStart={};unsaved=city.revision!=savedRevision;}
+        if((cityTool!=0&&cityTool!=ToolRail)||!app.active||io.MouseDown[1]||io.MouseDown[2]||ImGui::IsKeyPressed(ImGuiKey_Escape))roadStart={};
+        if(config.cityMode&&(cityTool==0||cityTool==ToolRail)&&ImGui::IsMouseReleased(0)&&roadStart.x>=0){if(hover.x>=0){if(cityTool==ToolRail)city.buildRail(*world,roadStart,hover,false,status);else if(selectedRoad==RoadClass::Street)city.buildDiagonalRoad(*world,roadStart,hover,status);else city.buildRoad(*world,roadStart,hover,false,status,selectedRoad);}roadStart={};unsaved=city.revision!=savedRevision;}
         if(config.cityInput){
             if(frame==12&&(world->roadCount()!=startingRoadCount||city.treasury!=100000))throw std::runtime_error("Road input built before mouse release");
             if(frame==14&&(world->roadCount()!=startingRoadCount+7||world->road(262,257)||world->diagonalCount()!=0||city.treasury!=99860))throw std::runtime_error("Road input did not build only the final straight line");
@@ -285,20 +304,31 @@ int run(HINSTANCE instance) {
             ImGui::SetNextWindowPos({24,24},ImGuiCond_Always);ImGui::SetNextWindowSize({320,float(app.height)-160},ImGuiCond_Always);
             ImGui::Begin("Build your city",nullptr,ImGuiWindowFlags_NoMove|ImGuiWindowFlags_NoResize);
             ImGui::TextColored({0.43f,0.88f,0.77f,1},"V O X E L C I T Y");
-            ImGui::TextWrapped("Connect local streets to the regional highway access road for immigration and trade. Right-click bulldozes ($5).");
+            ImGui::TextWrapped("Connect to the regional highway or build passenger and cargo stations along the railway for immigration and trade. Right-click bulldozes ($5).");
             if(ImGui::Selectable("Inspect parcel",cityTool==-1))cityTool=-1;
-            if(ImGui::Selectable("Two-lane road  $20/tile",cityTool==0))cityTool=0;
-            {auto a=ImGui::GetItemRectMin(),b=ImGui::GetItemRectMax();roadButton={(a.x+b.x)*.5f,(a.y+b.y)*.5f};}
-            if(cityTool==0)ImGui::TextWrapped("Click and drag to your destination, then release to build a straight or diagonal road. Esc cancels.");
-            if(ImGui::Selectable("Roundabout prefab  6 x 6  $160",cityTool==15))cityTool=15;
-            if(cityTool==15)ImGui::TextWrapped("Click to place. Fixed entry / exit at each side midpoint; counterclockwise traffic. Right-click removes the whole piece ($40).");
-            if(ImGui::Selectable("Road direction / signals",cityTool==14))cityTool=14;
-            if(cityTool==14){ImGui::Combo("Direction",&ruleDirection,"Two way\0North only\0East only\0South only\0West only\0");ImGui::Checkbox("Traffic signals",&signal);}
-            if(ImGui::Selectable("Bulldoze  $5",cityTool==13))cityTool=13;
+            for(RoadClass road:{RoadClass::Street,RoadClass::OneWay,RoadClass::Avenue,RoadClass::Highway4,RoadClass::Highway6}){const auto& d=RoadDefinitions[size_t(road)];std::string label=std::string(d.name)+"  $"+std::to_string(d.cost)+"/step";if(ImGui::Selectable(label.c_str(),cityTool==0&&selectedRoad==road)){cityTool=0;selectedRoad=road;}if(road==RoadClass::Street){auto a=ImGui::GetItemRectMin(),b=ImGui::GetItemRectMax();roadButton={(a.x+b.x)*.5f,(a.y+b.y)*.5f};}}
+            if(cityTool==0)ImGui::TextWrapped("Click and drag, then release. Wider roads reserve their complete corridor; highways do not provide zone frontage.");
+            if(ImGui::Selectable("Roundabout prefab  6 x 6  $160",cityTool==ToolRoundabout))cityTool=ToolRoundabout;
+            if(cityTool==ToolRoundabout)ImGui::TextWrapped("Click to place. Fixed entry / exit at each side midpoint; counterclockwise traffic. Right-click removes the whole piece ($40).");
+            if(ImGui::Selectable("Diamond interchange  9 x 9  $2500",cityTool==ToolInterchange))cityTool=ToolInterchange;
+            if(cityTool==ToolInterchange)ImGui::TextWrapped("Place on the median of a straight divided highway to add a fixed local-road crossing with highway access.");
+            if(ImGui::Selectable("Road direction / signals",cityTool==ToolRoadRule))cityTool=ToolRoadRule;
+            if(cityTool==ToolRoadRule){ImGui::Combo("Direction",&ruleDirection,"Two way\0North only\0East only\0South only\0West only\0");ImGui::Checkbox("Traffic signals",&signal);}
+            if(ImGui::Selectable("Bulldoze  $5",cityTool==ToolBulldoze))cityTool=ToolBulldoze;
+            if(ImGui::CollapsingHeader("Railway")){
+                if(ImGui::Selectable("Double track  $40 / tile",cityTool==ToolRail))cityTool=ToolRail;
+                for(auto kind:{BuildingKind::PassengerStation,BuildingKind::CargoTerminal,BuildingKind::TrainDepot}){auto& d=city.definition(kind);std::string label=d.name+"  $"+std::to_string(d.cost);if(ImGui::Selectable(label.c_str(),cityTool==int(kind)))cityTool=int(kind);}
+                if(ImGui::Selectable("Highway rail overpass  $3000",cityTool==ToolRailOverpass))cityTool=ToolRailOverpass;
+                if(ImGui::Button("Rotate station (R)"))railRotation=(railRotation+1)%4;
+                if(ImGui::Button("Regional railway")){camera.focus={248.f*TileSize,0,RegionalRailRow*float(TileSize)};camera.distance=TileSize*40;}
+                ImGui::TextWrapped("Drag tracks along one grid axis. Start on an existing track to connect. Stations need a local road and utilities. A depot enables local passenger trains.");
+                ImGui::Text("Active trains: %zu | Passenger journeys: %llu",city.railway.trains().size(),city.railway.stats().passengers);
+                ImGui::Text("Cargo moved: %llu units",city.railway.stats().cargo);
+            }
             ImGui::SeparatorText("Zones and facilities");
-            for(int k=1;k<int(BuildingKind::Count);++k){auto kind=BuildingKind(k);const auto& d=city.definition(kind);bool locked=!city.sandbox&&city.stats().milestone<d.unlock;
-                ImGui::BeginDisabled(locked);std::string label=d.name+(k>3?"  $"+std::to_string(d.cost):"");if(ImGui::Selectable(label.c_str(),cityTool==k))cityTool=k;ImGui::EndDisabled();
-                if(k==1){auto p=ImGui::GetItemRectMin();residentialButton={p.x+20,p.y+10};};if(k==4){auto p=ImGui::GetItemRectMin();powerButton={p.x+20,p.y+10};};
+            for(int k=1;k<int(BuildingKind::PassengerStation);++k){auto kind=BuildingKind(k);const auto& d=city.definition(kind);bool locked=!city.sandbox&&city.stats().milestone<d.unlock;
+                ImGui::BeginDisabled(locked);std::string label=d.name+(!zone(kind)?"  $"+std::to_string(d.cost):"");if(ImGui::Selectable(label.c_str(),cityTool==k))cityTool=k;ImGui::EndDisabled();
+                if(kind==BuildingKind::LowDensityResidential){auto p=ImGui::GetItemRectMin();residentialButton={p.x+20,p.y+10};};if(kind==BuildingKind::Power){auto p=ImGui::GetItemRectMin();powerButton={p.x+20,p.y+10};};
                 if(ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))ImGui::SetTooltip("Capacity %d | Upkeep $%d/min | Unlock %d residents",d.capacity,d.upkeep,d.unlock);}
             ImGui::Separator();
             if(ImGui::Button("Save city"))try{if(auto path=mapDialog(window,true)){city.save(*world,traffic,*path);savedRevision=city.revision;unsaved=false;status="City saved.";}}catch(const std::exception& e){status=e.what();}
@@ -311,7 +341,7 @@ int run(HINSTANCE instance) {
             if(ImGui::BeginPopupModal("Start a new city?",nullptr,ImGuiWindowFlags_AlwaysAutoResize)){
                 ImGui::TextUnformatted("This replaces the current city. Save first to keep it.");
                 if(ImGui::Button("Starter layout")){city.scenario(*world,traffic,0);app.renderer->invalidateWorld();savedRevision=~uint64_t(0);camera.focus={248.f*TileSize,0,225.f*TileSize};camera.distance=TileSize*45;selected={};overlay=0;ImGui::CloseCurrentPopup();}
-                if(ImGui::Button("New highway map")){city=CitySimulation(config.trafficSeed);city.loadDefinitions(dataPath);city.newCity(*world,traffic);app.renderer->invalidateWorld();camera.focus={HighwayJunctionX*float(TileSize),0,(HighwayEastRow+6)*float(TileSize)};camera.distance=TileSize*45;savedRevision=~uint64_t(0);selected={};overlay=0;ImGui::CloseCurrentPopup();}
+                if(ImGui::Button("New highway and railway map")){city=CitySimulation(config.trafficSeed);city.loadDefinitions(dataPath);city.newCity(*world,traffic);app.renderer->invalidateWorld();camera.focus={HighwayJunctionX*float(TileSize),0,(HighwayEastRow+6)*float(TileSize)};camera.distance=TileSize*45;savedRevision=~uint64_t(0);selected={};overlay=0;ImGui::CloseCurrentPopup();}
                 ImGui::SameLine();if(ImGui::Button("Cancel"))ImGui::CloseCurrentPopup();ImGui::EndPopup();}
             if(ImGui::Checkbox("Unlimited-money sandbox",&city.sandbox))++city.revision;
             ImGui::Checkbox("Build grid",&grid);ImGui::Checkbox("Sun shadows",&shadows);ImGui::Checkbox("VSync",&vsync);
@@ -333,10 +363,13 @@ int run(HINSTANCE instance) {
             if(showBudget){ImGui::SetNextWindowSize({420,380},ImGuiCond_FirstUseEver);ImGui::Begin("Budget and demand",&showBudget);
                 ImGui::Text("Income $%.0f / expenses $%.0f per minute",cs.income,cs.expenses);const char* names[]={"Residential tax","Commercial tax","Industrial tax"};
                 for(int i=0;i<3;++i){if(ImGui::SliderInt(names[i],&city.taxes[i],0,30,"%d%%"))++city.revision;ImGui::ProgressBar(cs.demand[i],{-1,0},"Demand");}
+                ImGui::Text("Rail infrastructure: $%.2f / minute",world->railUpkeep());
                 ImGui::Text("Utilities: supply / demand");for(int i=0;i<3;++i)ImGui::Text("%s: %d / %d",i==0?"Power":i==1?"Water":"Sewage",cs.capacity[i],cs.consumption[i]);
                 ImGui::BeginDisabled(city.loanTaken);if(ImGui::Button("Emergency loan: $25,000"))city.takeLoan();ImGui::EndDisabled();ImGui::TextWrapped("One loan per city; interest $250 per simulated minute. Taxes settle once per minute.");ImGui::End();}
             if(const auto* b=city.at(selected)){ImGui::SetNextWindowPos({float(app.width)-350,280},ImGuiCond_FirstUseEver);ImGui::SetNextWindowSize({326,0},ImGuiCond_Always);
                 ImGui::Begin("Selected parcel",nullptr,ImGuiWindowFlags_AlwaysAutoResize);ImGui::Text("%s | Level %d",city.definition(b->kind).name.c_str(),b->level);
+                if(b->kind==BuildingKind::CargoTerminal)ImGui::Text("Outbound cargo: %d / 120",city.waitingRailCargo(b->id));
+                if(railFacility(b->kind))ImGui::Text("Regional service: %s | Arriving passengers: %d",city.railway.regional(b->id)?"Connected":"Disconnected",b->railPassengers);
                 ImGui::Text("Residents %d | Workers %d | Goods %d",b->residents,b->workers,b->inventory);ImGui::Text("Happiness %.0f | Land value %.0f",b->happiness,b->landValue);ImGui::Text("Business productivity %.0f%%",b->productivity*100);
                 ImGui::Text("Waste %.0f | Health %.0f | Fire %.0f",b->waste,b->health,b->fire);ImGui::Text("Crime %.0f | Education %.0f",b->crime,b->education);ImGui::Text("Coverage: clinic %s / fire %s",b->services[1]>0?"yes":"no",b->services[2]>0?"yes":"no");ImGui::Text("Police %s / school %s / park %s",b->services[3]>0?"yes":"no",b->services[4]>0?"yes":"no",b->services[5]>0?"yes":"no");
                 ImGui::Text("Power %.0f%% | Water %.0f%% | Sewage %.0f%%",b->utilities[0]*100,b->utilities[1]*100,b->utilities[2]*100);
@@ -389,16 +422,33 @@ int run(HINSTANCE instance) {
                 if(x>=350&&x+size.x<app.width-20&&y>240&&y+size.y<app.height-200){auto* draw=ImGui::GetBackgroundDrawList();draw->AddRectFilled({x-10,y-6},{x+size.x+10,y+size.y+6},IM_COL32(18,65,46,240),4);draw->AddText({x,y},IM_COL32(235,245,230,255),label);}
             }
         }
-        if(config.cameraPath)camera.yaw=.65f+float(frame)*.001f;
+        if(config.cameraPath)camera.yaw=(config.captureCamera?config.captureCamera->yaw:.65f)+float(frame)*.001f;
         if(config.cityMode&&cityTool==0&&roadStart.x>=0&&hover.x>=0){
             auto vp=camera.view(app.width,app.height).viewProjection;auto line=World::diagonalLine(roadStart,hover);
             auto project=[&](Cell c){auto p=XMVector3TransformCoord(XMVectorSet(c.x*16.f+8,1,c.z*16.f+8,1),XMLoadFloat4x4(&vp));return ImVec2{(XMVectorGetX(p)+1)*app.width*.5f,(1-XMVectorGetY(p))*app.height*.5f};};
-            for(size_t i=1;i<line.size();++i)ImGui::GetForegroundDrawList()->AddLine(project(line[i-1]),project(line[i]),IM_COL32(80,220,205,200),6.f);
+            int tx=(hover.x>roadStart.x)-(hover.x<roadStart.x),tz=(hover.z>roadStart.z)-(hover.z<roadStart.z);if(!tx&&!tz)tx=1;Cell perpendicular{-tz,tx};unsigned width=RoadDefinitions[size_t(selectedRoad)].footprint;int firstOffset=width==2?0:-int(width/2),lastOffset=int(width/2);
+            for(int offset=firstOffset;offset<=lastOffset;++offset)for(size_t i=1;i<line.size();++i){Cell a{line[i-1].x+perpendicular.x*offset,line[i-1].z+perpendicular.z*offset},b{line[i].x+perpendicular.x*offset,line[i].z+perpendicular.z*offset};ImGui::GetForegroundDrawList()->AddLine(project(a),project(b),offset==0?IM_COL32(80,220,205,220):IM_COL32(80,180,205,150),6.f);}
         }
+        if(config.cityMode&&hover.x>=0&&(cityTool==ToolRail||cityTool==ToolRailOverpass||(cityTool>0&&cityTool<int(BuildingKind::Count)&&railFacility(BuildingKind(cityTool))))){
+            static Cell oldHover{},oldStart{};static int oldTool=-99,oldRotation=-1;static uint64_t oldRevision=~uint64_t(0);static double oldMoney=-1;static bool good=false;static double price=0;static std::string explanation;static std::vector<Cell> footprint;
+            if(hover!=oldHover||roadStart!=oldStart||cityTool!=oldTool||railRotation!=oldRotation||city.revision!=oldRevision||city.treasury!=oldMoney){
+                oldHover=hover;oldStart=roadStart;oldTool=cityTool;oldRotation=railRotation;oldRevision=city.revision;oldMoney=city.treasury;
+                auto preview=std::make_unique<World>(*world);CitySimulation candidate=city;candidate.sandbox=false;candidate.treasury=1e12;footprint.clear();
+                if(cityTool==ToolRail){Cell railStart=roadStart.x>=0?roadStart:hover;good=candidate.buildRail(*preview,railStart,hover,false,explanation);if(railStart.x==hover.x||railStart.z==hover.z)footprint=World::diagonalLine(railStart,hover);else footprint={hover};}
+                else if(cityTool==ToolRailOverpass){good=candidate.buildRailOverpass(*preview,hover,explanation);if(good){int owner=hover.z*MapSize+hover.x;for(int i=0;i<MapSize*MapSize;++i)if(preview->rails()[i].bridge==owner)footprint.push_back({i%MapSize,i/MapSize});}else footprint={hover};}
+                else {Building b;b.cell=hover;b.kind=BuildingKind(cityTool);b.variant=uint8_t(railRotation);footprint=CitySimulation::occupiedFootprint(b);good=candidate.placeRailFacility(*preview,hover,b.kind,railRotation,explanation);}
+                price=1e12-candidate.treasury;if(good&&!city.sandbox&&city.treasury<price){good=false;explanation="Insufficient funds.";}
+            }
+            auto vp=camera.view(app.width,app.height).viewProjection;auto project=[&](float x,float z){auto p=XMVector3TransformCoord(XMVectorSet(x,1,z,1),XMLoadFloat4x4(&vp));return ImVec2{(XMVectorGetX(p)+1)*app.width*.5f,(1-XMVectorGetY(p))*app.height*.5f};};
+            auto* draw=ImGui::GetForegroundDrawList();for(auto c:footprint)draw->AddQuad(project(c.x*16.f,c.z*16.f),project((c.x+1)*16.f,c.z*16.f),project((c.x+1)*16.f,(c.z+1)*16.f),project(c.x*16.f,(c.z+1)*16.f),good?IM_COL32(70,230,210,230):IM_COL32(255,90,70,230),2);
+            if(!io.WantCaptureMouse){ImGui::BeginTooltip();ImGui::Text("Rail construction: $%.0f%s",price,city.sandbox?" (sandbox)":"");ImGui::TextUnformatted(explanation.c_str());ImGui::EndTooltip();}
+        }
+        if(ImGui::IsKeyPressed(ImGuiKey_R)&&!io.WantTextInput)railRotation=(railRotation+1)%4;
         ImGui::Render();
-        View view=camera.view(app.width,app.height);view.showUI=!config.noUI;view.voxels=config.voxels;view.quality=config.quality;view.hover=hover;view.signalPhase=float((city.ticks()/180)%2);view.erase=button==1||(config.cityMode&&cityTool>0&&cityTool<13&&(world->road(hover.x,hover.z)||city.at(hover)));view.grid=grid;view.shadows=shadows;
-        if(config.cityMode&&cityTool==15&&button!=1&&hover.x>=0){view.hoverSpan=3;view.erase=!World::valid(hover.x+2,hover.z+2)||(!city.sandbox&&city.treasury<160);for(int z=0;z<3;++z)for(int x=0;x<3;++x){Cell c{hover.x+x,hover.z+z};view.erase|=world->roadOccupies(c)||city.at(c)||world->roundaboutOrigin(c).x>=0;}}
-        if(config.cityMode&&(button==1||cityTool==13)&&world->roundaboutOrigin(hover).x>=0){view.hover=world->roundaboutOrigin(hover);view.hoverSpan=3;view.erase=true;}
+        View view=camera.view(app.width,app.height);view.showUI=!config.noUI;view.voxels=config.voxels;view.quality=config.quality;view.hover=hover;view.signalPhase=float((city.ticks()/180)%2);view.erase=button==1||(config.cityMode&&cityTool>0&&cityTool<int(BuildingKind::Count)&&(world->road(hover.x,hover.z)||city.at(hover)));view.grid=grid;view.shadows=shadows;
+        if(config.cityMode&&cityTool==ToolRoundabout&&button!=1&&hover.x>=0){view.hoverSpan=3;view.erase=!World::valid(hover.x+2,hover.z+2)||(!city.sandbox&&city.treasury<160);for(int z=0;z<3;++z)for(int x=0;x<3;++x){Cell c{hover.x+x,hover.z+z};view.erase|=world->roadOccupies(c)||city.at(c)||world->roundaboutOrigin(c).x>=0;}}
+        if(config.cityMode&&cityTool==ToolInterchange&&button!=1&&hover.x>=0){view.hover={hover.x-4,hover.z-4};view.hoverSpan=9;view.erase=!World::valid(hover.x-4,hover.z-4)||!World::valid(hover.x+4,hover.z+4)||world->roadClass(hover)!=RoadClass::Median||(!city.sandbox&&city.treasury<2500);}
+        if(config.cityMode&&(button==1||cityTool==ToolBulldoze)&&world->roundaboutOrigin(hover).x>=0){view.hover=world->roundaboutOrigin(hover);view.hoverSpan=3;view.erase=true;}
         bool final=config.frames>0 && frame+1>=config.frames;
         if(config.cityMode){if(config.cityStress)city.replenishTrafficStress(traffic,size_t(config.cityStress));if(config.trafficBenchmark&&!city.paused){for(int i=0;i<city.speed;++i)city.tick(*world,traffic);}else city.update(*world,traffic,elapsed/1000);
             if(!city.paused&&!autosaveFolder.empty()){autosaveElapsed+=elapsed/1000;if(autosaveElapsed>=300){autosaveElapsed=0;try{std::filesystem::create_directories(autosaveFolder);city.save(*world,traffic,autosaveFolder/("autosave-"+std::to_string(autosaveSlot++%3)+".vcity"));status="Autosaved to "+autosaveFolder.string();}catch(const std::exception& e){status=e.what();}}}
@@ -406,7 +456,9 @@ int run(HINSTANCE instance) {
         if(frame>=30){trafficTimes.push_back(traffic.stats().tickMs);routingTimes.push_back(traffic.stats().routingMs);minimumCars=std::min(minimumCars,traffic.stats().active);maximumCars=std::max(maximumCars,traffic.stats().active);}
         auto capture=final?config.capture:std::filesystem::path{};
         if(!config.captureSequence.empty()&&frame>=30){std::filesystem::create_directories(config.captureSequence);std::ostringstream name;name<<"frame-"<<std::setw(5)<<std::setfill('0')<<frame-30<<".bmp";capture=config.captureSequence/name.str();}
-        app.renderer->render(*world,view,vsync,capture,traffic.instances());
+        auto cars=traffic.instances();std::vector<CarInstance> vehicles(cars.begin(),cars.end());
+        if(config.cityMode){auto trains=city.railway.instances(*world);vehicles.insert(vehicles.end(),trains.begin(),trains.end());}
+        app.renderer->render(*world,view,vsync,capture,vehicles);
         if(frame>=30&&capture.empty())mainWorkTimes.push_back(std::chrono::duration<double,std::milli>(Clock::now()-now).count());
         if(config.frames>0&&!config.threadingTest)app.renderer->waitIdle();
         if(config.windowTest && frame==35) SetWindowPos(window,nullptr,0,0,1280,800,SWP_NOMOVE|SWP_NOZORDER);
@@ -433,6 +485,7 @@ int run(HINSTANCE instance) {
             <<",\n  \"cars\": "<<traffic.stats().active<<", \"car_target\": "<<traffic.target()<<", \"min_cars\": "<<(minimumCars==SIZE_MAX?0:minimumCars)<<", \"max_cars\": "<<maximumCars
             <<",\n  \"traffic_p50_ms\": "<<percentile(.5)<<", \"traffic_p95_ms\": "<<percentile(.95)<<", \"routing_average_ms\": "<<average(routingTimes)
             <<",\n  \"traffic_pending\": "<<traffic.stats().pending<<", \"completed_trips\": "<<traffic.stats().completed<<", \"traffic_memory_mib\": "<<double(traffic.stats().memoryBytes)/(1024*1024)
+            <<",\n  \"rail_trains\": "<<city.railway.trains().size()<<", \"rail_passengers\": "<<city.railway.stats().passengers<<", \"rail_cargo\": "<<city.railway.stats().cargo
             <<",\n  \"city_population\": "<<city.stats().population<<", \"city_tick_ms\": "<<city.stats().tickMs<<", \"city_balance\": "<<city.stats().balance
             <<",\n  \"traffic_seed\": "<<config.trafficSeed<<", \"traffic_warmup_seconds\": "<<trafficWarmupSeconds
             <<",\n  \"debug_errors\": "<<app.renderer->stats.debugErrors<<", \"total_seconds\": "<<std::chrono::duration<double>(Clock::now()-start).count()<<",\n  \"rendered_frames\": "<<app.renderer->presented<<", \"replaced_frames\": "<<app.renderer->dropped

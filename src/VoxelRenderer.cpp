@@ -5,6 +5,7 @@
 #include <fstream>
 #include <map>
 #include <unordered_map>
+#include <unordered_set>
 #include <algorithm>
 #include <cstring>
 #include <cmath>
@@ -19,14 +20,14 @@ void checked(HRESULT hr,const char* what){if(FAILED(hr))throw std::runtime_error
 void barrier(ID3D12GraphicsCommandList4* l,ID3D12Resource* r,D3D12_RESOURCE_STATES a,D3D12_RESOURCE_STATES b){if(a==b)return;D3D12_RESOURCE_BARRIER v{};v.Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;v.Transition={r,D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,a,b};l->ResourceBarrier(1,&v);}
 void order(ID3D12GraphicsCommandList4* l,ID3D12Resource* r){D3D12_RESOURCE_BARRIER b{};b.Type=D3D12_RESOURCE_BARRIER_TYPE_UAV;b.UAV.pResource=r;l->ResourceBarrier(1,&b);}
 std::vector<char> code(const wchar_t* name){wchar_t exe[32768]{};GetModuleFileNameW(nullptr,exe,32768);std::ifstream f(std::filesystem::path(exe).parent_path()/L"shaders"/name,std::ios::binary|std::ios::ate);if(!f)throw std::runtime_error("Missing voxel shader. Rebuild shaders.");std::vector<char> v(size_t(f.tellg()));f.seekg(0);f.read(v.data(),v.size());return v;}
-struct Instance {uint32_t primitive,words,id,color;XMFLOAT4 pose,previous;};
-static_assert(sizeof(Instance)==48);
+struct Instance {uint32_t primitive,words,id,color;XMFLOAT4 pose,previous,roof,roofProfile,height;};
+static_assert(sizeof(Instance)==96);
 struct Constants {XMFLOAT4X4 inverse,vp,previous;XMFLOAT4 eye,oldEye,sun,screen,settings,hover;};
 }
 struct VoxelRenderer::Impl {
     ID3D12Device5* device;
     ID3D12GraphicsCommandList4* list=nullptr;
-    struct Model {VoxelModel cpu;ComPtr<ID3D12Resource> blas;uint32_t first=0,words=0;uint64_t bytes=0;D3D12_GPU_VIRTUAL_ADDRESS address=0;};
+    struct Model {VoxelModel cpu;ComPtr<ID3D12Resource> blas;uint32_t first=0,words=0;uint64_t bytes=0;D3D12_GPU_VIRTUAL_ADDRESS address=0;XMFLOAT4 roof{},roofProfile{};};
     struct Frame {
         ComPtr<ID3D12Resource> tlas,scratch,descs,instances,constants,styles;
         unsigned capacity=0;
@@ -38,13 +39,19 @@ struct VoxelRenderer::Impl {
     };
     std::array<Frame,3> frames;
     std::array<std::shared_ptr<Model>,ChunkCount> terrain;
+    std::unordered_map<uint64_t,std::vector<std::weak_ptr<Model>>> terrainCache;
     std::map<unsigned,std::shared_ptr<Model>> buildings;
     std::shared_ptr<Model> flat,car;
+    std::array<std::shared_ptr<Model>,3> trainModels;
+    std::array<std::shared_ptr<Model>,TreeVariantCount> treeModels;
+    std::array<std::vector<TreeInstance>,ChunkCount> treeChunks;
+    std::array<uint64_t,ChunkCount> treeRevisions{};
+    size_t treeCount=0;
     std::vector<VoxelPrimitive> packedPrimitives;
     std::vector<uint32_t> packedWords;
     uint64_t dataRevision=0;
     std::vector<std::pair<size_t,std::shared_ptr<Model>>> parcels;
-    struct CarPose {XMFLOAT4 pose;unsigned frame;uint32_t id;};
+    struct CarPose {XMFLOAT4 pose;unsigned frame;uint32_t id;float y=0;};
     uint32_t nextCarId=0x800000u;
     std::unordered_map<uint64_t,CarPose> oldCars;
     std::vector<D3D12_RAYTRACING_INSTANCE_DESC> sceneDescs;
@@ -116,16 +123,66 @@ struct VoxelRenderer::Impl {
         if(timingReady[slot]){uint64_t* p=nullptr;D3D12_RANGE range{slot*5*sizeof(uint64_t),(slot+1)*5*sizeof(uint64_t)};checked(readback->Map(0,&range,reinterpret_cast<void**>(&p)),"Read voxel timings");double factor=1000./double(timestampFrequency);stats.voxelSceneMs=(p[slot*5+1]-p[slot*5])*factor;stats.voxelSurfaceMs=(p[slot*5+2]-p[slot*5+1])*factor;stats.voxelLightMs=(p[slot*5+3]-p[slot*5+2])*factor;stats.voxelResolveMs=(p[slot*5+4]-p[slot*5+3])*factor;D3D12_RANGE empty{};readback->Unmap(0,&empty);}
         list->EndQuery(queries.Get(),D3D12_QUERY_TYPE_TIMESTAMP,slot*5);
         auto dirty=world.takeDirty();bool changed=!dirty.empty()||parcelRevision!=world.parcelRevision()||replacement!=world.replacementRevision();
-        if(!flat){VoxelModel ground;ground.primitives.push_back({{0,-.25f,0},0,{float(ChunkSize),0,float(ChunkSize)},VGrass});flat=model(std::move(ground),f);terrain.fill(flat);car=model(carVoxels(),f);}
+        if(!flat){VoxelModel ground;ground.primitives.push_back({{0,-.25f,0},0,{float(ChunkSize),0,float(ChunkSize)},VGrass});flat=model(std::move(ground),f);terrain.fill(flat);car=model(carVoxels(),f);for(unsigned i=0;i<3;++i)trainModels[i]=model(trainVoxels(i+1),f);}
         stats.rebuiltChunks=0;
-        for(int chunk:dirty){auto next=world.chunkEmpty(chunk)?flat:model(terrainVoxels(world,chunk),f);f.oldModels.push_back(terrain[chunk]);terrain[chunk]=next;buffersDirty=true;++stats.rebuiltChunks;}
+        for(int chunk:dirty){
+            auto next=flat;
+            if(!world.chunkEmpty(chunk)){
+                auto geometry=terrainVoxels(world,chunk);const auto& previous=terrain[chunk]->cpu;
+                // Neighbor invalidation can leave a chunk visually identical.
+                // Keep its GPU model and packed offsets when every voxel agrees.
+                if(geometry.words==previous.words&&geometry.primitives.size()==previous.primitives.size()&&
+                   (geometry.primitives.empty()||std::memcmp(geometry.primitives.data(),previous.primitives.data(),geometry.primitives.size()*sizeof(VoxelPrimitive))==0))continue;
+                // A sampled hash only selects candidates; full comparison below
+                // makes sharing exact even when different chunks hash alike.
+                uint64_t key=1469598103934665603ull;
+                auto mix=[&](uint64_t value){key=(key^value)*1099511628211ull;};
+                mix(geometry.primitives.size());mix(geometry.words.size());
+                const auto* bytes=reinterpret_cast<const unsigned char*>(geometry.primitives.data());
+                for(size_t i=0;i<geometry.primitives.size()*sizeof(VoxelPrimitive);++i)mix(bytes[i]);
+                for(size_t i=0;i<geometry.words.size();i+=std::max(size_t(1),geometry.words.size()/64))mix(geometry.words[i]);
+                auto& candidates=terrainCache[key];
+                std::erase_if(candidates,[](const auto& entry){return entry.expired();});
+                next.reset();
+                for(const auto& entry:candidates)if(auto candidate=entry.lock()){
+                    const auto& cached=candidate->cpu;
+                    if(geometry.words==cached.words&&geometry.primitives.size()==cached.primitives.size()&&
+                       (geometry.primitives.empty()||std::memcmp(geometry.primitives.data(),cached.primitives.data(),geometry.primitives.size()*sizeof(VoxelPrimitive))==0)){
+                        next=std::move(candidate);break;
+                    }
+                }
+                if(!next){next=model(std::move(geometry),f);candidates.push_back(next);}
+            }
+            if(next==terrain[chunk])continue;
+            f.oldModels.push_back(terrain[chunk]);terrain[chunk]=next;buffersDirty=true;++stats.rebuiltChunks;
+        }
+        if(number%60==0)std::erase_if(terrainCache,[](auto& bucket){
+            std::erase_if(bucket.second,[](const auto& entry){return entry.expired();});return bucket.second.empty();
+        });
         if(parcelRevision!=world.parcelRevision()||replacement!=world.replacementRevision()){
-            parcels.clear();for(size_t i=0;i<world.parcels().size();++i){auto p=world.parcels()[i];if(!p.kind)continue;unsigned key=unsigned(p.kind)*16+p.level*4+p.variant;auto& m=buildings[key];if(!m)m=model(buildingVoxels(p),f);parcels.emplace_back(i,m);}parcelRevision=world.parcelRevision();}
+            parcels.clear();for(size_t i=0;i<world.parcels().size();++i){auto p=world.parcels()[i];if(!p.kind)continue;unsigned key=unsigned(p.kind)*24+p.level*8+p.variant;auto& m=buildings[key];if(!m){m=model(buildingVoxels(p),f);
+                if(p.kind==1&&p.level){
+                    bool dense=p.variant>=4;uint8_t art=p.variant&3;bool narrow=!dense&&art==2;
+                    m->roof={(!narrow&&(art&2))?0.f:1.f,(!narrow&&(art&2))?1.f:0.f,narrow?7.5f:8.f,dense?14.f+p.level*10.f+(art%3)*2.f:5.f+p.level*3.f+(narrow?0.f:(art%3)*1.5f)};
+                    m->roofProfile=narrow?XMFLOAT4{4,.75f,.375f,.5f}:XMFLOAT4{5.75f,.75f,.1875f,.25f};
+                }
+                if(p.kind==3&&p.level){m->roof={1,0,2,4.5f+p.level*.75f};m->roofProfile={4,.5f,.125f,.125f};}
+            }parcels.emplace_back(i,m);}parcelRevision=world.parcelRevision();}
+        treeCount=0;
+        for(int chunk=0;chunk<ChunkCount;++chunk){
+            if(replacement!=world.replacementRevision()||treeRevisions[chunk]!=world.vegetationChunkRevision(chunk)){
+                treeChunks[chunk]=world.trees(chunk);treeRevisions[chunk]=world.vegetationChunkRevision(chunk);changed=true;
+            }
+            treeCount+=treeChunks[chunk].size();
+        }
+        if(treeCount&&!treeModels[0])for(uint8_t i=0;i<TreeVariantCount;++i)treeModels[i]=model(treeVoxels(i),f);
         if(replacement!=world.replacementRevision()){oldCars.clear();nextCarId=0x800000u;}
         replacement=world.replacementRevision();stats.voxelCpuTerrainMs=elapsed();
         if(buffersDirty){
             auto& all=packedPrimitives;auto& packed=packedWords;all.clear();packed.clear();std::vector<std::shared_ptr<Model>> unique{flat,car};
-            for(const auto& m:terrain)if(m!=flat)unique.push_back(m);for(const auto& [key,m]:buildings)unique.push_back(m);
+            std::unordered_set<const Model*> seen{flat.get(),car.get()};
+            for(const auto& m:terrain)if(seen.insert(m.get()).second)unique.push_back(m);for(const auto& [key,m]:buildings)unique.push_back(m);
+            for(const auto& m:treeModels)if(m)unique.push_back(m);for(auto m:trainModels)if(m)unique.push_back(m);
             size_t primitiveCount=0,wordCount=0;for(const auto& m:unique){primitiveCount+=m->cpu.primitives.size();wordCount+=m->cpu.words.size();}all.reserve(primitiveCount);packed.reserve(wordCount);
             stats.voxelBytes=0;
             for(auto& m:unique){m->first=uint32_t(all.size());m->words=uint32_t(packed.size());all.insert(all.end(),m->cpu.primitives.begin(),m->cpu.primitives.end());packed.insert(packed.end(),m->cpu.words.begin(),m->cpu.words.end());stats.voxelBytes+=m->bytes;}
@@ -144,16 +201,21 @@ struct VoxelRenderer::Impl {
         }
         stats.voxelCpuPackMs=elapsed();
         auto& descs=sceneDescs;auto& instances=sceneInstances;descs.clear();instances.clear();
-        const size_t count=ChunkCount+parcels.size()+cars.size();descs.reserve(count);instances.reserve(count);
-        auto add=[&](const std::shared_ptr<Model>& m,XMFLOAT4 pose,XMFLOAT4 old,uint32_t id,uint32_t color){
-            D3D12_RAYTRACING_INSTANCE_DESC d{};d.Transform[0][0]=pose.w;d.Transform[0][2]=pose.z;d.Transform[0][3]=pose.x;d.Transform[1][1]=1;d.Transform[2][0]=-pose.z;d.Transform[2][2]=pose.w;d.Transform[2][3]=pose.y;d.InstanceID=UINT(instances.size());d.InstanceMask=255;d.AccelerationStructure=m->address;descs.push_back(d);instances.push_back({m->first,m->words,id,color,pose,old});};
+        const size_t count=ChunkCount+parcels.size()+cars.size()+treeCount;descs.reserve(count);instances.reserve(count);
+        auto add=[&](const std::shared_ptr<Model>& m,XMFLOAT4 pose,XMFLOAT4 old,uint32_t id,uint32_t color,float y=0,float oldY=0){
+            D3D12_RAYTRACING_INSTANCE_DESC d{};d.Transform[0][0]=pose.w;d.Transform[0][2]=pose.z;d.Transform[0][3]=pose.x;d.Transform[1][1]=1;d.Transform[1][3]=y;d.Transform[2][0]=-pose.z;d.Transform[2][2]=pose.w;d.Transform[2][3]=pose.y;d.InstanceID=UINT(instances.size());d.InstanceMask=255;d.AccelerationStructure=m->address;descs.push_back(d);instances.push_back({m->first,m->words,id,color,pose,old,m->roof,m->roofProfile,{y,oldY,0,0}});};
         for(unsigned i=0;i<ChunkCount;++i){XMFLOAT4 p{float(i%ChunksAcross*ChunkSize),float(i/ChunksAcross*ChunkSize),0,1};add(terrain[i],p,p,i+1,0);}
         for(auto& [tile,m]:parcels){XMFLOAT4 p{float(tile%MapSize*TileSize),float(tile/MapSize*TileSize),0,1};add(m,p,p,uint32_t(2048+tile),uint32_t(tile));}
+        for(const auto& chunk:treeChunks)for(const auto& tree:chunk){auto pose=treeVoxelPose(tree);XMFLOAT4 p{pose[0],pose[1],pose[2],pose[3]};
+            // Vary scrub within the darker existing leaf colors at instance setup.
+            uint32_t color=tree.variant==4?2u+((tree.tile*2654435761u)>>31):tree.variant;
+            add(treeModels[tree.variant],p,p,0x100000u+tree.tile,color);
+        }
         // G-buffer identities must remain exactly representable as float32.
         // Reassign on exhaustion and discard history rather than aliasing live cars.
         if(uint64_t(nextCarId)+cars.size()>=0xffffffu){oldCars.clear();nextCarId=0x800000u;changed=true;}
         if(oldCars.bucket_count()<cars.size())oldCars.reserve(cars.size()*2);
-        for(auto& c:cars){float len=std::sqrt(c.dx*c.dx+c.dz*c.dz);XMFLOAT4 p{c.x,c.z,len>0?c.dx/len:0,len>0?c.dz/len:1};auto [found,inserted]=oldCars.try_emplace(c.id,CarPose{p,number,nextCarId});if(inserted)++nextCarId;auto old=inserted||found->second.frame+1!=number?p:found->second.pose;add(car,p,old,found->second.id,c.color);found->second.pose=p;found->second.frame=number;}
+        for(auto& c:cars){float len=std::sqrt(c.dx*c.dx+c.dz*c.dz);XMFLOAT4 p{c.x,c.z,len>0?c.dx/len:0,len>0?c.dz/len:1};auto [found,inserted]=oldCars.try_emplace(c.id,CarPose{p,number,nextCarId});if(inserted)++nextCarId;auto old=inserted||found->second.frame+1!=number?p:found->second.pose;add(c.vehicle?trainModels[std::min(3u,c.vehicle)-1]:car,p,old,found->second.id,c.color,c.y,inserted?c.y:found->second.y);found->second.y=c.y;found->second.pose=p;found->second.frame=number;}
         if(number%60==0)std::erase_if(oldCars,[&](const auto& entry){return entry.second.frame!=number;});
         stats.voxelInstances=UINT(count);stats.visibleCars=UINT(cars.size());stats.triangles=stats.visibleTriangles=0;stats.visibleChunks=ChunkCount;
         D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS in{};in.Type=D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL;in.DescsLayout=D3D12_ELEMENTS_LAYOUT_ARRAY;in.NumDescs=UINT(count);in.Flags=D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PREFER_FAST_TRACE;
@@ -165,7 +227,9 @@ struct VoxelRenderer::Impl {
         fill(f.styles.Get(),world.tileStyles().data(),world.tileStyles().size()*4);
         bool reset=!validHistory||changed||styleRevision!=world.styleRevision()||previousFrame+1!=number||oldQuality!=view.quality||oldShadows!=view.shadows;
         float cameraDelta=std::abs(view.eye.x-previousEye.x)+std::abs(view.eye.y-previousEye.y)+std::abs(view.eye.z-previousEye.z);reset|=cameraDelta>50;
-        Constants c{};c.inverse=view.rayInverse;c.vp=view.viewProjection;c.previous=reset?view.viewProjection:previousVP;c.eye={view.eye.x,view.eye.y,view.eye.z,0};c.oldEye={previousEye.x,previousEye.y,previousEye.z,0};c.sun={-.55f,.82f,.3f,view.signalPhase};c.screen={float(width),float(height),float(number%4096),reset?1.f:0.f};c.settings={float(view.quality),view.shadows?1.f:0.f,0,0};c.hover={float(view.hover.x),float(view.hover.z),(view.erase?1.f:0.f)+2.f*(view.hoverSpan-1),view.grid?1.f:0.f};fill(f.constants.Get(),&c,sizeof(c));
+        // Exact view equality prevents stationary history from drifting through reprojection.
+        bool stationaryView=!reset&&cameraDelta==0&&std::memcmp(&view.viewProjection,&previousVP,sizeof(previousVP))==0;
+        Constants c{};c.inverse=view.rayInverse;c.vp=view.viewProjection;c.previous=reset?view.viewProjection:previousVP;c.eye={view.eye.x,view.eye.y,view.eye.z,0};c.oldEye={previousEye.x,previousEye.y,previousEye.z,0};c.sun={-.55f,.82f,-.3f,view.signalPhase};c.screen={float(width),float(height),float(number%4096),reset?1.f:0.f};c.settings={float(view.quality),view.shadows?1.f:0.f,stationaryView?1.f:0.f,0};c.hover={float(view.hover.x),float(view.hover.z),(view.erase?1.f:0.f)+2.f*(view.hoverSpan-1),view.grid?1.f:0.f};fill(f.constants.Get(),&c,sizeof(c));
         previousVP=view.viewProjection;previousEye=view.eye;previousFrame=number;oldQuality=view.quality;oldShadows=view.shadows;styleRevision=world.styleRevision();validHistory=true;
         ID3D12DescriptorHeap* heaps[]={heap.Get()};list->SetDescriptorHeaps(1,heaps);list->SetGraphicsRootSignature(root.Get());list->SetGraphicsRootConstantBufferView(0,f.constants->GetGPUVirtualAddress());list->SetGraphicsRootShaderResourceView(1,f.tlas->GetGPUVirtualAddress());list->SetGraphicsRootShaderResourceView(2,f.primitiveData->GetGPUVirtualAddress());list->SetGraphicsRootShaderResourceView(3,f.wordData->GetGPUVirtualAddress());list->SetGraphicsRootShaderResourceView(4,f.instances->GetGPUVirtualAddress());list->SetGraphicsRootShaderResourceView(5,f.styles->GetGPUVirtualAddress());auto table=heap->GetGPUDescriptorHandleForHeapStart();table.ptr+=ping*9*srvStride;list->SetGraphicsRootDescriptorTable(6,table);list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         stats.voxelCpuInstancesMs=elapsed();
@@ -193,12 +257,30 @@ void VoxelRenderer::validateTraversal(){
     D3D12_ROOT_SIGNATURE_DESC rootDesc{};rootDesc.NumParameters=5;rootDesc.pParameters=params;ComPtr<ID3DBlob> blob,error;checked(D3D12SerializeRootSignature(&rootDesc,D3D_ROOT_SIGNATURE_VERSION_1,&blob,&error),"Test root serialization");ComPtr<ID3D12RootSignature> root;checked(device->CreateRootSignature(0,blob->GetBufferPointer(),blob->GetBufferSize(),IID_PPV_ARGS(&root)),"Test root");
     auto shader=code(L"voxel.test.cso");D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};pd.pRootSignature=root.Get();pd.CS={shader.data(),shader.size()};ComPtr<ID3D12PipelineState> pipeline;checked(device->CreateComputePipelineState(&pd,IID_PPV_ARGS(&pipeline)),"Test pipeline");
     auto model=carVoxels();model.primitives.push_back({{0,0,0},uint32_t(model.words.size()),{2,2,2},0});model.words.resize(model.words.size()+128);
+    for(uint8_t variant=0;variant<TreeVariantCount;++variant){auto tree=treeVoxels(variant);uint32_t base=uint32_t(model.words.size());
+        for(auto p:tree.primitives){if(!p.material)p.data=(p.data&0xff000000u)|((p.data&0xffffffu)+base);model.primitives.push_back(p);}
+        model.words.insert(model.words.end(),tree.words.begin(),tree.words.end());
+    }
+    for(uint8_t variant:std::array<uint8_t,3>{0,1,3}){auto facade=buildingVoxels({1,1,variant,0});uint32_t base=uint32_t(model.words.size());
+        for(auto p:facade.primitives){if(!p.material)p.data=(p.data&0xff000000u)|((p.data&0xffffffu)+base);model.primitives.push_back(p);}
+        model.words.insert(model.words.end(),facade.words.begin(),facade.words.end());
+    }
+    unsigned glassTestIndex=unsigned(model.primitives.size()),glassWords=unsigned(model.words.size());
+    model.primitives.push_back({{0,0,0},glassWords,{2,2,2},0});model.words.resize(glassWords+128);
+    model.words[glassWords]=VGlass;model.words[glassWords+1]=VBrick;
     constexpr unsigned count=8192;std::vector<XMFLOAT4> rays(count*2);std::vector<VoxelRayHit> expected(count);std::vector<bool> valid(count);
     std::mt19937 rng(173);std::uniform_real_distribution<float> random(-1,1);
-    for(unsigned i=0;i<count;++i){unsigned index=i%unsigned(model.primitives.size());const auto& p=model.primitives[index];float o[3],d[3];
-        for(int a=0;a<3;++a){o[a]=(p.lo[a]+p.hi[a])*.5f+random(rng)*3;d[a]=random(rng);}
+    for(unsigned i=0;i<count;++i){unsigned index=i<2?glassTestIndex:i%unsigned(model.primitives.size());const auto& p=model.primitives[index];float o[3],d[3];
+        // Sample relative to each brick so finer geometry still exercises hits.
+        for(int a=0;a<3;++a){o[a]=(p.lo[a]+p.hi[a])*.5f+random(rng)*(p.hi[a]-p.lo[a])*1.5f;d[a]=random(rng);}
         if(i%4==0){d[0]=d[2]=0;d[1]=i%8==0?1.f:-1.f;}float norm=std::sqrt(d[0]*d[0]+d[1]*d[1]+d[2]*d[2]);for(auto& v:d)v/=norm;
-        rays[i*2]={o[0],o[1],o[2],float(index)};rays[i*2+1]={d[0],d[1],d[2],0};valid[i]=intersectVoxel(p,model.words,o,d,.003f,1000,expected[i]);}
+        uint32_t ignored=i%2?VGlass:0;
+        if(i<2){o[0]=-1;o[1]=o[2]=.125f;d[0]=1;d[1]=d[2]=0;}
+        bool limited=i>=2&&i%3==0;
+        rays[i*2]={o[0],o[1],o[2],float(index)};rays[i*2+1]={d[0],d[1],d[2],limited?-11.f:float(ignored)};
+        if(limited){valid[i]=intersectVoxel(p,model.words,o,d,.003f,.75f,expected[i],VLeaf);
+            if(!valid[i])valid[i]=intersectVoxel(p,model.words,o,d,.75f,1000,expected[i]);
+        }else valid[i]=intersectVoxel(p,model.words,o,d,.003f,1000,expected[i],ignored);}
     auto prim=s.buffer(model.primitives.size()*sizeof(VoxelPrimitive),D3D12_HEAP_TYPE_UPLOAD,D3D12_RESOURCE_STATE_GENERIC_READ);s.fill(prim.Get(),model.primitives.data(),model.primitives.size()*sizeof(VoxelPrimitive));
     auto vox=s.buffer(model.words.size()*4,D3D12_HEAP_TYPE_UPLOAD,D3D12_RESOURCE_STATE_GENERIC_READ);s.fill(vox.Get(),model.words.data(),model.words.size()*4);
     auto input=s.buffer(rays.size()*sizeof(XMFLOAT4),D3D12_HEAP_TYPE_UPLOAD,D3D12_RESOURCE_STATE_GENERIC_READ);s.fill(input.Get(),rays.data(),rays.size()*sizeof(XMFLOAT4));

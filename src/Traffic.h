@@ -4,8 +4,8 @@
 #include <span>
 
 namespace vc {
-struct CarInstance { float x,z,dx,dz; uint32_t color; uint64_t id=0; };
-struct TrafficCarState {uint64_t id;Cell tile,destination;float x,z,speed;bool awaitingRoute;};
+struct CarInstance { float x,z,dx,dz; uint32_t color; uint64_t id=0;uint8_t lane=0; float y=0;uint32_t vehicle=0; };
+struct TrafficCarState {uint64_t id;Cell tile,destination;float x,z,speed;bool awaitingRoute;uint8_t lane=0;};
 struct TrafficStats {
     size_t active=0, pending=0, capacity=0, memoryBytes=0;
     uint64_t completed=0, removed=0, ticks=0, routeExpansions=0;

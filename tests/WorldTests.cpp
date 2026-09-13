@@ -23,6 +23,7 @@ int main() try {
             CHECK(w->column(mid,origin+2).height==0);
         }
         CHECK(!w->mesh(0).indices.empty());
+        for(const auto& vertex:w->mesh(0).vertices)CHECK(vertex.y==0||vertex.y==.25f);
     }
     w=std::make_unique<World>();
     CHECK(TileSize==2*GridSize);

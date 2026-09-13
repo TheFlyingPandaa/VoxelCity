@@ -96,12 +96,16 @@ private:
     ComPtr<ID3D12PipelineState> pipeline_;
     ComPtr<ID3D12PipelineState> carPipeline_;
     std::shared_ptr<GpuMesh> carMesh_;
-    static constexpr size_t ParcelVariants=13*3*4;
+    std::array<std::shared_ptr<GpuMesh>,3> trainMeshes_;
+    static constexpr size_t BuildingVisualVariants=8,TreeVariantBase=16*3*BuildingVisualVariants, ParcelVariants=TreeVariantBase+TreeVariantCount;
     struct ParcelInstance {float x,z;};
     struct SceneParcel {ParcelInstance position;size_t variant;};
     std::array<std::shared_ptr<GpuMesh>,ParcelVariants*2> parcelMeshes_;
     std::vector<SceneParcel> sceneParcels_;
     std::array<std::vector<ParcelInstance>,ParcelVariants*2> parcelGroups_;
+    std::array<std::vector<TreeInstance>,ChunkCount> treeChunks_;
+    std::array<uint64_t,ChunkCount> treeRevisions_{};
+    uint64_t vegetationRevision_=~uint64_t(0);
     uint64_t parcelRevision_=~uint64_t(0);
     ComPtr<ID3D12PipelineState> buildingPipeline_;
     ComPtr<ID3D12QueryHeap> timestamps_;

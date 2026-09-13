@@ -27,6 +27,12 @@ static void checkSeparated(std::span<const CarInstance> cars) {
 int main(int argc,char** argv)try {
     vc::NetworkWorker::blocking=true;
     {
+        auto avenue=std::make_unique<World>();for(int x=10;x<=40;++x){avenue->setRoad(x,10,true);avenue->setRoadClass({x,10},RoadClass::Avenue);avenue->setRoadRule({x,10},2);}
+        TrafficSimulation lanes({0,17,20000,64,true});for(uint64_t id=1;id<=12;++id)CHECK(lanes.requestTrip({id,1,{10,10},{40,10},1}));
+        bool usedPassingLane=false;for(int tick=0;tick<300;++tick){lanes.tick(*avenue);for(auto car:lanes.debugSnapshot())usedPassingLane|=car.lane==1;checkSeparated(lanes.instances());}
+        CHECK(usedPassingLane);lanes.validate(*avenue);
+    }
+    {
         // All four diagonal headings, two-way traffic and a cardinal junction.
         auto map=std::make_unique<World>();
         for(auto c:World::diagonalLine({10,10},{30,30}))map->setDiagonalRoad(c,false);

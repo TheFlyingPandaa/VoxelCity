@@ -36,4 +36,4 @@ Households represent groups of residents. Commuting is sampled; freight and disp
 
 The game starts with voxel ray tracing and High lighting quality. Low and Medium reduce secondary-light sampling and tracing distance. The build grid starts hidden; enable it in the build panel when useful for construction. Buildings and moving cars now receive and cast soft shadows, with material-dependent reflections and bounced daylight.
 
-Use `--renderer legacy` to compare the old mesh renderer. City saves and gameplay rules are unchanged. The graphics target is 1440p at 60 FPS on an RTX 4070; see `VOXEL_RENDERER.md` for measured scenarios.
+Use `--renderer legacy` to compare the old mesh renderer. Both renderers show natural broadleaf and conifer groves. Building roads, painting zones or placing facilities clears trees for free; they stay cleared after demolition. Version 5 saves remember clearing, and older saves still load with trees added on unused land. The graphics target is 1440p at 60 FPS on an RTX 4070; see `VOXEL_RENDERER.md` for measured scenarios.

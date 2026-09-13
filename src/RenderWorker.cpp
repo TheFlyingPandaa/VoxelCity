@@ -39,7 +39,7 @@ void RenderWorker::waitIdle(){
 }
 void RenderWorker::render(World& world,const View& view,bool vsync,const std::filesystem::path& capture,std::span<const CarInstance> cars) {
     auto start=std::chrono::steady_clock::now();poll();
-    if(!snapshot_||snapshot_->topologyRevision()!=world.topologyRevision()||snapshot_->replacementRevision()!=world.replacementRevision()||snapshot_->parcelRevision()!=world.parcelRevision()||snapshot_->styleRevision()!=world.styleRevision()) {
+    if(!snapshot_||snapshot_->railRevision()!=world.railRevision()||snapshot_->topologyRevision()!=world.topologyRevision()||snapshot_->replacementRevision()!=world.replacementRevision()||snapshot_->parcelRevision()!=world.parcelRevision()||snapshot_->styleRevision()!=world.styleRevision()||snapshot_->vegetationRevision()!=world.vegetationRevision()) {
         snapshot_=std::make_shared<World>(world);
     }
     Packet p;p.world=snapshot_;p.view=view;p.vsync=vsync;p.width=width_;p.height=height_;p.capture=capture;p.generation=generation_;p.cars.assign(cars.begin(),cars.end());

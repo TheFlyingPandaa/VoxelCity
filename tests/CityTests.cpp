@@ -42,6 +42,19 @@ int main(int argc,char** argv) try {
         CHECK(restoredCity.buildRoundabout(*restored,{20,20},message));
     }
     {
+        auto map=std::make_unique<World>();CitySimulation c;
+        CHECK(c.buildRoad(*map,{20,20},{24,20},false,message,RoadClass::Avenue));
+        CHECK(c.treasury==99700);for(int x=20;x<=24;++x){CHECK(map->roadClass({x,20})==RoadClass::Avenue);CHECK(map->roadClass({x,21})==RoadClass::Avenue);CHECK(map->lanesPerDirection({x,20})==2);}
+        CHECK(map->canTravel({20,20},{21,20}));CHECK(!map->canTravel({21,20},{20,20}));
+        CHECK(map->canTravel({21,21},{20,21}));CHECK(!map->canTravel({20,21},{21,21}));
+        CHECK(c.bulldoze(*map,{22,21},message));CHECK(!map->road(22,20));CHECK(!map->road(22,21));
+        CHECK(c.buildRoad(*map,{40,30},{50,30},false,message,RoadClass::Highway6));
+        CHECK(map->roadClass({45,30})==RoadClass::Median);CHECK(map->connections(45,30)==0);CHECK(map->lanesPerDirection({45,29})==3);CHECK(!map->zoningFrontage({45,29}));
+        CHECK(c.buildRoad(*map,{45,27},{45,28},false,message));CHECK(!map->canTravel({45,28},{45,29}));
+        CHECK(c.buildDiamondInterchange(*map,{45,30},message));CHECK(map->canTravel({45,28},{45,29}));CHECK(map->canTravel({45,31},{45,32}));
+        CHECK(c.buildRoad(*map,{60,60},{65,65},false,message,RoadClass::OneWay));CHECK(map->canTravel({62,62},{63,63}));CHECK(!map->canTravel({63,63},{62,62}));
+    }
+    {
         auto map=std::make_unique<World>();CitySimulation c;TrafficSimulation sim({0,42,20000,64,true});
         CHECK(c.buildDiagonalRoad(*map,{10,10},{20,20},message));CHECK(map->roadCount()==11);CHECK(c.treasury==99780);
         CHECK(!c.buildDiagonalRoad(*map,{10,11},{11,10},message));CHECK(!map->road(10,11));
@@ -61,11 +74,16 @@ int main(int argc,char** argv) try {
     CHECK(city.place(*w,{9,1},BuildingKind::Power,message));CHECK(city.place(*w,{9,2},BuildingKind::Water,message));CHECK(city.place(*w,{9,3},BuildingKind::Sewage,message));
     CHECK(!city.place(*w,{9,3},BuildingKind::Residential,message));CHECK(!city.place(*w,{10,3},BuildingKind::Residential,message));CHECK(!city.place(*w,{9,4},BuildingKind::Police,message));
     CHECK(city.place(*w,{9,10},BuildingKind::Residential,message));CHECK(city.place(*w,{9,11},BuildingKind::Industrial,message));CHECK(city.place(*w,{9,12},BuildingKind::Commercial,message));
+    CHECK(city.place(*w,{9,13},BuildingKind::HighDensityResidential,message));CHECK(city.place(*w,{9,14},BuildingKind::HighDensityCommercial,message));
+    CHECK(city.definition(BuildingKind::HighDensityResidential).capacity==3*city.definition(BuildingKind::LowDensityResidential).capacity);
+    CHECK(city.definition(BuildingKind::HighDensityCommercial).capacity==3*city.definition(BuildingKind::LowDensityCommercial).capacity);
     advance(city,*w,traffic,900);city.validate(*w);traffic.validate(*w);CHECK(city.stats().population>0);CHECK(city.at({9,10})->utilities[0]==1);CHECK(city.stats().jobs>0);
     CHECK(city.buildRoad(*w,{10,5},{10,5},true,message));advance(city,*w,traffic,30);CHECK(!city.at({9,10})->external);CHECK(city.at({9,10})->utilities[0]==0);
     CHECK(city.buildRoad(*w,{10,5},{10,5},false,message));advance(city,*w,traffic,30);CHECK(city.at({9,10})->external);CHECK(city.at({9,10})->utilities[0]==1);
     auto save=folder/"city.vcity";city.save(*w,traffic,save);
+    {std::ifstream saved(save,std::ios::binary);uint32_t magic=0,version=0;saved.read(reinterpret_cast<char*>(&magic),4);saved.read(reinterpret_cast<char*>(&version),4);CHECK(magic==0x59544356u);CHECK(version==7);}
     auto otherWorld=std::make_unique<World>();CitySimulation other;TrafficSimulation otherTraffic({0,42,20000,64,true});other.load(*otherWorld,otherTraffic,save);other.validate(*otherWorld);otherTraffic.validate(*otherWorld);
+    CHECK(other.at({9,13})->kind==BuildingKind::HighDensityResidential);CHECK(other.at({9,14})->kind==BuildingKind::HighDensityCommercial);CHECK(otherWorld->parcels()[13*MapSize+9].variant>=4);
     CHECK(other.stats().population==city.stats().population);CHECK(other.treasury==city.treasury);CHECK(otherTraffic.outstandingTrips()==traffic.outstandingTrips());
     advance(city,*w,traffic,180);advance(other,*otherWorld,otherTraffic,180);
     city.save(*w,traffic,folder/"a.vcity");other.save(*otherWorld,otherTraffic,folder/"b.vcity");CHECK(bytes(folder/"a.vcity")==bytes(folder/"b.vcity"));

@@ -96,7 +96,7 @@ Renderer::~Renderer() {
 }
 void Renderer::assertOwner() const {if(std::this_thread::get_id()!=ownerThread_)throw std::logic_error("Renderer accessed outside its owning thread");}
 void Renderer::invalidateWorld() {
-    assertOwner();waitIdle();voxelRenderer_.reset();parcelRevision_=~uint64_t(0);initialWorld_=true;pendingChunks_.clear();
+    assertOwner();waitIdle();voxelRenderer_.reset();vegetationRevision_=~uint64_t(0);treeRevisions_.fill(~uint64_t(0));parcelRevision_=~uint64_t(0);initialWorld_=true;pendingChunks_.clear();
     for(auto& revision:chunkRevisions_)++revision;
 }
 void Renderer::wait(uint64_t value) {
@@ -151,15 +151,15 @@ void Renderer::createPipeline() {
     auto carVs=shader(L"cars.vs.cso"),carPs=shader(L"cars.ps.cso");
     D3D12_INPUT_ELEMENT_DESC carLayout[]={layout[0],layout[1],layout[2],
         {"INSTANCE",0,DXGI_FORMAT_R32G32B32A32_FLOAT,1,0,D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA,1},
-        {"COLOR",0,DXGI_FORMAT_R32_UINT,1,16,D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA,1}};
-    p.InputLayout={carLayout,5};p.VS={carVs.data(),carVs.size()};p.PS={carPs.data(),carPs.size()};
+        {"COLOR",0,DXGI_FORMAT_R32_UINT,1,16,D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA,1},{"HEIGHT",0,DXGI_FORMAT_R32_FLOAT,1,UINT(offsetof(CarInstance,y)),D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA,1}};
+    p.InputLayout={carLayout,6};p.VS={carVs.data(),carVs.size()};p.PS={carPs.data(),carPs.size()};
     check(device_->CreateGraphicsPipelineState(&p,IID_PPV_ARGS(&carPipeline_)),"Create car pipeline");
     auto buildingVs=shader(L"buildings.vs.cso");
     D3D12_INPUT_ELEMENT_DESC buildingLayout[]={layout[0],layout[1],layout[2],{"INSTANCEOFFSET",0,DXGI_FORMAT_R32G32_FLOAT,1,0,D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA,1}};
     p.InputLayout={buildingLayout,4};p.VS={buildingVs.data(),buildingVs.size()};p.PS={ps.data(),ps.size()};
     check(device_->CreateGraphicsPipelineState(&p,IID_PPV_ARGS(&buildingPipeline_)),"Create building pipeline");
 }
-static Mesh carMesh() {
+static Mesh carMesh(unsigned kind=0) {
     Mesh m;
     auto box=[&](float x0,float y0,float z0,float x1,float y1,float z1,uint32_t material) {
         const float vertices[8][3]={{x0,y0,z0},{x1,y0,z0},{x1,y1,z0},{x0,y1,z0},{x0,y0,z1},{x1,y0,z1},{x1,y1,z1},{x0,y1,z1}};
@@ -168,6 +168,7 @@ static Mesh carMesh() {
         for(int f=0;f<6;++f){uint32_t base=uint32_t(m.vertices.size());for(int k:faces[f])m.vertices.push_back({vertices[k][0],vertices[k][1],vertices[k][2],normals[f][0],normals[f][1],normals[f][2],material});
             for(int k:{0,1,2,0,2,3})m.indices.push_back(base+uint32_t(k));}
     };
+    if(kind){for(auto b:World::trainBoxes(kind))box(b.x0,b.y0,b.z0,b.x1,b.y1,b.z1,b.material==Material::Window?1:b.material==Material::Asphalt||b.material==Material::Roof?2:b.material==Material::Marking?3:b.material==Material::Curb?4:0);return m;}
     box(-1.5f,0.6f,-3,1.5f,1.9f,3,0);box(-1.2f,1.9f,-1.6f,1.2f,2.9f,1.3f,1);
     for(float x:{-1.55f,1.05f})for(float z:{-2.f,1.2f})box(x,0.15f,z,x+0.5f,1,z+0.8f,2);
     box(-1.2f,1,2.99f,1.2f,1.4f,3.01f,3);
@@ -275,13 +276,20 @@ void Renderer::render(World& world,const View& view,bool vsync,const std::filesy
         while(!pendingChunks_.empty()&&batch.size()<16){int chunk=*pendingChunks_.begin();pendingChunks_.erase(pendingChunks_.begin());batch.push_back({chunk,chunkRevisions_[chunk]});}
         meshing_=std::async(std::launch::async,[snapshot,batch=std::move(batch)](){std::vector<MeshedChunk> results;for(auto [chunk,revision]:batch)results.push_back({chunk,revision,snapshot->chunkEmpty(chunk)?Mesh{}:snapshot->mesh(chunk)});return results;});
     }
-    if(parcelRevision_!=world.parcelRevision() || !dirty.empty()){
+    if(parcelRevision_!=world.parcelRevision() || vegetationRevision_!=world.vegetationRevision() || !dirty.empty()){
         sceneParcels_.clear();const auto& parcels=world.parcels();
-        for(size_t t=0;t<parcels.size();++t){auto p=parcels[t];if(!p.kind)continue;size_t key=p.kind*12+p.level*4+p.variant;
+        for(size_t t=0;t<parcels.size();++t){auto p=parcels[t];if(!p.kind)continue;size_t key=p.kind*3*BuildingVisualVariants+p.level*BuildingVisualVariants+p.variant;
             if(!parcelMeshes_[key])parcelMeshes_[key]=uploadMesh(World::parcelMesh(p),frame);
             if(!parcelMeshes_[key+ParcelVariants])parcelMeshes_[key+ParcelVariants]=uploadMesh(World::parcelMesh(p,true),frame,false);
             sceneParcels_.push_back({{float(t%MapSize*TileSize),float(t/MapSize*TileSize)},key});}
-        parcelRevision_=world.parcelRevision();++worldGeneration_;
+        for(int chunk=0;chunk<ChunkCount;++chunk){
+            if(treeRevisions_[chunk]!=world.vegetationChunkRevision(chunk)){treeChunks_[chunk]=world.trees(chunk);treeRevisions_[chunk]=world.vegetationChunkRevision(chunk);}
+            for(const auto& tree:treeChunks_[chunk]){size_t key=TreeVariantBase+tree.variant;
+                if(!parcelMeshes_[key]){parcelMeshes_[key]=uploadMesh(World::treeMesh(tree.variant),frame);parcelMeshes_[key+ParcelVariants]=parcelMeshes_[key];}
+                sceneParcels_.push_back({{tree.x,tree.z},key});
+            }
+        }
+        vegetationRevision_=world.vegetationRevision();parcelRevision_=world.parcelRevision();++worldGeneration_;
     }
     if(!dirty.empty()) ++worldGeneration_;
     if(frame.generation!=worldGeneration_) buildScene(frame);
@@ -326,21 +334,26 @@ void Renderer::render(World& world,const View& view,bool vsync,const std::filesy
             list_->IASetVertexBuffers(0,2,views);list_->IASetIndexBuffer(&mesh->ib);list_->DrawIndexedInstanced(mesh->indexCount,UINT(group.size()),0,0,0);offset+=group.size();stats.visibleTriangles+=group.size()*mesh->indexCount/3;}
     }
     stats.visibleCars=0;
-    if(!cars.empty()) {
-        if(frame.carCapacity<cars.size()) {frame.carCapacity=std::max(cars.size(),std::max(size_t(65536),frame.carCapacity*2));frame.cars=buffer(frame.carCapacity*sizeof(CarInstance),D3D12_HEAP_TYPE_UPLOAD,D3D12_RESOURCE_STATE_GENERIC_READ);}
+    for(unsigned kind=0;kind<4;++kind)if(!cars.empty()) {
+        unsigned visibleCount=0,totalCount=0;
+        if(frame.carCapacity<cars.size()*4) {frame.carCapacity=std::max(cars.size()*4,std::max(size_t(65536),frame.carCapacity*2));frame.cars=buffer(frame.carCapacity*sizeof(CarInstance),D3D12_HEAP_TYPE_UPLOAD,D3D12_RESOURCE_STATE_GENERIC_READ);}
         CarInstance* output=nullptr;D3D12_RANGE empty{0,0};check(frame.cars->Map(0,&empty,reinterpret_cast<void**>(&output)),"Map car instances");
         for(const auto& car:cars) {
+            if(car.vehicle!=kind)continue;++totalCount;
             bool visible=true;for(auto plane:planes){XMFLOAT4 p;XMStoreFloat4(&p,plane);
-                if(p.x*car.x+p.y*1.5f+p.z*car.z+p.w+4.f*(std::abs(p.x)+std::abs(p.y)+std::abs(p.z))<0){visible=false;break;}}
-            if(visible)output[stats.visibleCars++]=car;
+                if(p.x*car.x+p.y*(car.y+2.f)+p.z*car.z+p.w+8.f*(std::abs(p.x)+std::abs(p.y)+std::abs(p.z))<0){visible=false;break;}}
+            if(visible)output[kind*cars.size()+visibleCount++]=car;
         }
         frame.cars->Unmap(0,nullptr);
-        if(stats.visibleCars){
+        if(visibleCount){
+            auto mesh=carMesh_;if(kind){if(!trainMeshes_[kind-1])trainMeshes_[kind-1]=uploadMesh(carMesh(kind),frame,false);mesh=trainMeshes_[kind-1];}
             list_->SetPipelineState(carPipeline_.Get());list_->SetGraphicsRoot32BitConstants(0,36,&constants,0);
-            D3D12_VERTEX_BUFFER_VIEW views[]={carMesh_->vb,{frame.cars->GetGPUVirtualAddress(),UINT(stats.visibleCars*sizeof(CarInstance)),sizeof(CarInstance)}};
-            list_->IASetVertexBuffers(0,2,views);list_->IASetIndexBuffer(&carMesh_->ib);list_->DrawIndexedInstanced(carMesh_->indexCount,stats.visibleCars,0,0,0);
+            D3D12_VERTEX_BUFFER_VIEW views[]={mesh->vb,{frame.cars->GetGPUVirtualAddress()+kind*cars.size()*sizeof(CarInstance),UINT(visibleCount*sizeof(CarInstance)),sizeof(CarInstance)}};
+            list_->IASetVertexBuffers(0,2,views);list_->IASetIndexBuffer(&mesh->ib);list_->DrawIndexedInstanced(mesh->indexCount,visibleCount,0,0,0);
+            stats.triangles+=totalCount*mesh->indexCount/3;stats.visibleTriangles+=visibleCount*mesh->indexCount/3;
         }
-        stats.triangles+=cars.size()*carMesh_->indexCount/3;stats.visibleTriangles+=stats.visibleCars*carMesh_->indexCount/3;
+        stats.visibleCars+=visibleCount;
+
     }
     }
     ID3D12DescriptorHeap* heaps[]={srvHeap_.Get()};list_->SetDescriptorHeaps(1,heaps);if(view.showUI&&ui)ImGui_ImplDX12_RenderDrawData(ui,list_.Get());

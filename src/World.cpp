@@ -8,6 +8,8 @@
 namespace vc {
 namespace {
 bool roundRule(uint8_t r){return r>=64&&r<=72&&r!=68;}
+int roadDirection(uint8_t r){return r&ExtendedDirectionRule?r&15:r&7;}
+bool validRule(uint8_t r){return roundRule(r)||(r&ExtendedDirectionRule?(r&15)<=8:((r&7)<=4&&r<=63));}
 constexpr int ringNext[9]={3,0,1,6,-1,2,7,8,5};
 constexpr int ringMask[9]={6,11,12,13,0,7,3,14,9};
 uint32_t ruleStyle(uint8_t r){return uint32_t(r)<<2;}
@@ -24,6 +26,7 @@ bool World::placeRoundabout(Cell o) {
     for(int z=0;z<3;++z)for(int x=0;x<3;++x)if(roadOccupies({o.x+x,o.z+z})||roundaboutOrigin({o.x+x,o.z+z}).x>=0||parcels_[(o.z+z)*MapSize+o.x+x].kind)return false;
     for(int i=0;i<9;++i)if(i!=4)setRoad(o.x+i%3,o.z+i/3,true);
     for(int i=0;i<9;++i)if(i!=4)setRoadRule({o.x+i%3,o.z+i/3},uint8_t(64+i));
+    for(int z=0;z<3;++z)for(int x=0;x<3;++x)clearVegetation({o.x+x,o.z+z});
     return true;
 }
 bool World::removeRoundabout(Cell c) {
@@ -39,15 +42,18 @@ Cell World::cellAt(float x,float z) {
 bool World::road(int x, int z) const { return valid(x,z) && roads_[z*MapSize+x] != 0; }
 uint8_t World::connections(int x, int z) const {
     if(!road(x,z))return 0;
+    if(roadClass({x,z})==RoadClass::Median)return 0;
     auto permits=[&](Cell c,int d){
-        uint8_t rule=roadRule(c);int oneWay=rule&7;
+        uint8_t rule=roadRule(c);int oneWay=roadDirection(rule);
         if(roundRule(rule))return d<4&&(ringMask[rule-64]&(1<<d));
-        if(rule&HighwayRule)return d<4&&(oneWay==0||(oneWay%2)==((d+1)%2));
+        if(rule&HighwayAccessRule)return d<4;
+        if(highway(c)||roadDefinition(c).oneWay)return oneWay==0||oneWay-1==d||oppositeDirection(oneWay-1)==d;
         return true;
     };
     uint8_t mask=0;
     for(int d=0;d<8;++d){Cell a{x,z},b{x+RoadDX[d],z+RoadDZ[d]};
-        if(!road(b.x,b.z)||!permits(a,d)||!permits(b,oppositeDirection(d)))continue;
+        if(!road(b.x,b.z)||roadClass(b)==RoadClass::Median||!permits(a,d)||!permits(b,oppositeDirection(d)))continue;
+        if(highway(a)!=highway(b)&&!((roadRule(a)|roadRule(b))&HighwayAccessRule))continue;
         if(d>=4){
             auto supports=[&](Cell c){auto t=roadType(c);return t==4||(t==2&&(d==5||d==7))||(t==3&&(d==4||d==6));};
             if(!supports(a)&&!supports(b))continue;
@@ -82,18 +88,49 @@ bool World::setDiagonalRoad(Cell c,bool rising){
     if(old>=2&&old!=type)type=4;
     if(old==type)return false;
     setRoad(c.x,c.z,true);roads_[c.z*MapSize+c.x]=type;if(old<2)++diagonalCount_;
+    clearConstructionVegetation(c);
     ++revision_;trafficChanges_.push_back(c);
     for(int z=-1;z<=1;++z)for(int x=-1;x<=1;++x)if(valid(c.x+x,c.z+z))dirty_.insert((c.z+z)/ChunkTiles*ChunksAcross+(c.x+x)/ChunkTiles);
     return true;
+}
+std::vector<Cell> World::roadCrossSection(Cell c) const {
+    if(!road(c.x,c.z))return {};
+    auto cls=roadClass(c);if(cls!=RoadClass::Avenue&&cls!=RoadClass::Highway4&&cls!=RoadClass::Highway6&&cls!=RoadClass::Median)return {c};
+    auto oppositeRule=[](int a,int b){return a>=1&&a<=8&&b==oppositeDirection(a-1)+1;};
+    if(cls==RoadClass::Avenue){for(int d=0;d<8;++d){Cell n{c.x+RoadDX[d],c.z+RoadDZ[d]};if(roadClass(n)==cls&&oppositeRule(roadDirection(roadRule(c)),roadDirection(roadRule(n))))return {c,n};}return {c};}
+    Cell median=c;if(cls!=RoadClass::Median){median={};for(int d=0;d<4;++d){Cell n{c.x+RoadDX[d],c.z+RoadDZ[d]};if(roadClass(n)==RoadClass::Median){median=n;break;}}}
+    if(median.x<0)return {c};
+    for(int d=0;d<2;++d){Cell a{median.x+RoadDX[d],median.z+RoadDZ[d]},b{median.x-RoadDX[d],median.z-RoadDZ[d]};auto ca=roadClass(a),cb=roadClass(b);if((ca==RoadClass::Highway4||ca==RoadClass::Highway6)&&(cb==RoadClass::Highway4||cb==RoadClass::Highway6))return {a,median,b};}
+    return {c};
+}
+bool World::placeDiamondInterchange(Cell c){
+    if(!valid(c.x-4,c.z-4)||!valid(c.x+4,c.z+4)||roadClass(c)!=RoadClass::Median)return false;
+    bool horizontal=roadClass({c.x-1,c.z})==RoadClass::Median&&roadClass({c.x+1,c.z})==RoadClass::Median;
+    bool vertical=roadClass({c.x,c.z-1})==RoadClass::Median&&roadClass({c.x,c.z+1})==RoadClass::Median;
+    if(horizontal==vertical)return false;
+    Cell a=horizontal?Cell{c.x,c.z-1}:Cell{c.x-1,c.z},b=horizontal?Cell{c.x,c.z+1}:Cell{c.x+1,c.z};
+    if(!highway(a)||!highway(b))return false;
+    for(int i=-4;i<=4;++i){Cell p=horizontal?Cell{c.x,c.z+i}:Cell{c.x+i,c.z};if(p==a||p==b){setRoadRule(p,uint8_t(roadRule(p)|HighwayAccessRule));continue;}if(!road(p.x,p.z))setRoad(p.x,p.z,true);setRoadClass(p,RoadClass::Avenue);}
+    for(int dz=-4;dz<=4;++dz)for(int dx=-4;dx<=4;++dx)clearVegetation({c.x+dx,c.z+dz});return true;
+}
+bool World::setRoadClass(Cell c,RoadClass roadClass){
+    if(!valid(c.x,c.z)||!road(c.x,c.z)||roadClass<=RoadClass::None||roadClass>RoadClass::Median)return false;
+    auto& value=classes_[c.z*MapSize+c.x];auto next=uint8_t(roadClass);if(value==next)return false;
+    bool wasHighway=highway(c);value=next;bool isHighway=highway(c);
+    if(wasHighway!=isHighway){if(isHighway)++highwayCount_;else --highwayCount_;}
+    ++revision_;++styleRevision_;trafficChanges_.push_back(c);
+    for(int dz=-1;dz<=1;++dz)for(int dx=-1;dx<=1;++dx)if(valid(c.x+dx,c.z+dz))dirty_.insert((c.z+dz)/ChunkTiles*ChunksAcross+(c.x+dx)/ChunkTiles);
+    clearConstructionVegetation(c);return true;
 }
 bool World::setRoad(int x, int z, bool value) {
     if(roundaboutOrigin({x,z}).x>=0)return false;
     if (!valid(x,z) || road(x,z) == value) return false;
     if(!value&&roadType({x,z})>=2)--diagonalCount_;
     roads_[z*MapSize+x] = uint8_t(value);
-    if(!value){if(highway({x,z}))--highwayCount_;rules_[z*MapSize+x]=0;styles_[z*MapSize+x]=0;++styleRevision_;}
+    if(value)classes_[z*MapSize+x]=uint8_t(RoadClass::Street);
+    else {if(highway({x,z}))--highwayCount_;classes_[z*MapSize+x]=0;rules_[z*MapSize+x]=0;styles_[z*MapSize+x]=0;++styleRevision_;}
     ++revision_; trafficChanges_.push_back({x,z});
-    if (value) ++count_; else --count_;
+    if (value) {++count_;clearConstructionVegetation({x,z});} else --count_;
     // Cardinal neighbors change templates; diagonals can expose curb side faces.
     for (int dz=-1; dz<=1; ++dz) for (int dx=-1; dx<=1; ++dx)
         if (valid(x+dx,z+dz)) dirty_.insert((z+dz)/ChunkTiles*ChunksAcross+(x+dx)/ChunkTiles);
@@ -115,6 +152,7 @@ void World::stroke(Cell from, Cell to, bool value) {
 Column World::column(int x, int z) const {
     if(x<0||z<0||x>=WorldSize||z>=WorldSize)return {0,Material::Grass};
     Cell cell{x/TileSize,z/TileSize};Cell origin=roundaboutOrigin(cell);
+    if(roadClass(cell)==RoadClass::Median)return {0,Material::Grass};
     if(origin.x>=0){
         float px=x+.5f-(origin.x*TileSize+24),pz=z+.5f-(origin.z*TileSize+24);
         float ring=std::abs(std::hypot(px,pz)-16.f)-5.f;
@@ -160,11 +198,14 @@ Column World::column(int x, int z) const {
         if(edge==0)return {1,Material::Curb};
         if(edge==1)return {0,Material::Marking};
         if(edge==2)return {0,Material::HighwayShoulder};
-        return {0,Material::Asphalt};
+        int cross=(m&(North|South))?u:v;unsigned lanes=roadDefinition(cell).lanesPerDirection;
+        bool laneMark=lanes>1&&cross>2&&cross<TileSize-3&&((cross-2)*int(lanes))%(TileSize-4)<int(lanes);
+        return {0,laneMark?Material::Marking:Material::Asphalt};
     }
     if (edge<SidewalkWidth) return {1,Material::Sidewalk};
     if (edge==SidewalkWidth) return {1,Material::Curb};
     constexpr int center=TileSize/2-1;
+    auto cls=roadClass(cell);unsigned perDirection=roadDefinition(cell).lanesPerDirection;
     int degree=((m&North)!=0)+((m&East)!=0)+((m&South)!=0)+((m&West)!=0);
     bool marking=false;
     if (degree<3) {
@@ -174,12 +215,17 @@ Column World::column(int x, int z) const {
                 ((m&West) && v==center && u<=center && u%8<4) ||
                 ((m&East) && v==center && u>=center && u%8<4);
     }
+    if((cls==RoadClass::Avenue||cls==RoadClass::OneWay)&&degree<3){
+        int cross=(m&(North|South))?u:v;
+        if(perDirection>1&&cross>SidewalkWidth+1&&cross<TileSize-SidewalkWidth-2)
+            marking|=cross==TileSize/4||cross==3*TileSize/4;
+    }
     return {0,marking?Material::Marking:Material::Asphalt};
 }
 bool World::chunkEmpty(int chunk) const {
     int tx=chunk%ChunksAcross*ChunkTiles, tz=chunk/ChunksAcross*ChunkTiles;
     for (int z=tz; z<tz+ChunkTiles; ++z) for (int x=tx; x<tx+ChunkTiles; ++x)
-        if (roadOccupies({x,z})) return false;
+        if (roadOccupies({x,z})||hasRail({x,z})) return false;
     return true;
 }
 Mesh World::mesh(int chunk) const {
@@ -208,7 +254,7 @@ Mesh World::mesh(int chunk) const {
             ++h;
         }
         for (int j=0;j<h;++j) for (int i=0;i<w;++i) used[(z+j)*ChunkSize+x+i]=true;
-        float a=float(x), b=float(z), y=float(c.height), r=float(x+w), d=float(z+h);
+        float a=float(x), b=float(z), y=c.height*TerrainStepHeight, r=float(x+w), d=float(z+h);
         quad({{{a,y,b},{a,y,d},{r,y,d},{r,y,b}}},0,1,0,c.material);
     }
     // Merge exposed curb walls along each row/column.
@@ -224,13 +270,22 @@ Mesh World::mesh(int chunk) const {
             if (exposed && run<0) run=t;
             if (!exposed && run>=0) {
                 float a=float(run),b=float(t), l=float(line);
-                if(axis==0) quad({{{l,0,a},{l,0,b},{l,1,b},{l,1,a}}},-1,0,0,Material::Curb);
-                if(axis==1) quad({{{l+1,0,b},{l+1,0,a},{l+1,1,a},{l+1,1,b}}},1,0,0,Material::Curb);
-                if(axis==2) quad({{{b,0,l},{a,0,l},{a,1,l},{b,1,l}}},0,0,-1,Material::Curb);
-                if(axis==3) quad({{{a,0,l+1},{b,0,l+1},{b,1,l+1},{a,1,l+1}}},0,0,1,Material::Curb);
+                if(axis==0) quad({{{l,0,a},{l,0,b},{l,TerrainStepHeight,b},{l,TerrainStepHeight,a}}},-1,0,0,Material::Curb);
+                if(axis==1) quad({{{l+1,0,b},{l+1,0,a},{l+1,TerrainStepHeight,a},{l+1,TerrainStepHeight,b}}},1,0,0,Material::Curb);
+                if(axis==2) quad({{{b,0,l},{a,0,l},{a,TerrainStepHeight,l},{b,TerrainStepHeight,l}}},0,0,-1,Material::Curb);
+                if(axis==3) quad({{{a,0,l+1},{b,0,l+1},{b,TerrainStepHeight,l+1},{a,TerrainStepHeight,l+1}}},0,0,1,Material::Curb);
                 run=-1;
             }
         }
+    }
+    for(auto b:railBoxes(chunk)) {
+        float x=b.x0,z=b.z0,r=b.x1,d=b.z1,y=b.y0,h=b.y1;auto m=b.material;
+        quad({{{x,h,z},{x,h,d},{r,h,d},{r,h,z}}},0,1,0,m);
+        quad({{{x,y,z},{r,y,z},{r,y,d},{x,y,d}}},0,-1,0,m);
+        quad({{{x,y,z},{x,y,d},{x,h,d},{x,h,z}}},-1,0,0,m);
+        quad({{{r,y,d},{r,y,z},{r,h,z},{r,h,d}}},1,0,0,m);
+        quad({{{r,y,z},{x,y,z},{x,h,z},{r,h,z}}},0,0,-1,m);
+        quad({{{x,y,d},{r,y,d},{r,h,d},{x,h,d}}},0,0,1,m);
     }
     return out;
 }
@@ -245,13 +300,14 @@ Mesh World::parcelMesh(ParcelVisual p,bool simple) {
         quad({{{x,bottom,z+d},{x+w,bottom,z+d},{x+w,top,z+d},{x,top,z+d}}},0,0,1,mat);
     };
     {
+        if(p.kind>=13){for(auto b:railFacilityBoxes(p))box(b.x0,b.z0,b.x1-b.x0,b.z1-b.z0,b.y0,b.y1,b.material);return out;}
         if(!p.kind)return out;
         Material mat=p.kind<=3?Material(uint8_t(Material::Residential)+p.kind-1):p.kind<=6?Material::Utility:Material::Service;
         if(p.tint)mat=p.tint==1?Material::Bad:p.tint==2?Material::Warning:Material::Good;
         float px=0,pz=0;
         box(px+1,pz+1,14,14,0,0.15f,mat);
         if(!p.level)return out;
-        float h=4.f+p.level*4.f+(p.variant%4)*2.f;
+        bool dense=p.variant>=4;uint8_t art=p.variant&3;float h=dense?14.f+p.level*10.f+art*2.f:4.f+p.level*4.f+art*2.f;
         box(px+3,pz+3,10,10,0.15f,h,mat);
         box(px+2,pz+2,12,12,h,h+1,Material::Roof);
         if(p.variant%2)box(px+5,pz+5,5,5,h+1,h+3,mat);
@@ -293,17 +349,19 @@ void World::load(const std::filesystem::path& path) {
         throw std::runtime_error("Truncated or invalid map data.");
     uint32_t h=2166136261u; for(auto b:candidate) { h^=b; h*=16777619u; }
     if(h!=header[5]) throw std::runtime_error("Map checksum does not match.");
-    std::copy(candidate.begin(),candidate.end(),roads_.begin());
-    highwayCount_=0;std::fill(rules_.begin(),rules_.end(),uint8_t(0)); std::fill(styles_.begin(),styles_.end(),0u);++styleRevision_; clearParcelVisuals();
+    vegetationEnabled_=false;std::fill(clearedTrees_.begin(),clearedTrees_.end(),uint8_t(0));vegetationChunks_.fill(++vegetationRevision_);
+    clearRails();std::copy(candidate.begin(),candidate.end(),roads_.begin());
+    highwayCount_=0;std::fill(classes_.begin(),classes_.end(),uint8_t(0));for(size_t i=0;i<candidate.size();++i)if(candidate[i])classes_[i]=uint8_t(RoadClass::Street);std::fill(rules_.begin(),rules_.end(),uint8_t(0)); std::fill(styles_.begin(),styles_.end(),0u);++styleRevision_; clearParcelVisuals();
     ++revision_; ++replacement_; trafficChanges_.clear();
     diagonalCount_=std::count_if(roads_.begin(),roads_.end(),[](auto r){return r>=2;});count_=std::count_if(roads_.begin(),roads_.end(),[](auto r){return r!=0;}); dirtyAll();
 }
 void World::generateScenario(int scenario) {
+    vegetationEnabled_=false;std::fill(clearedTrees_.begin(),clearedTrees_.end(),uint8_t(0));vegetationChunks_.fill(++vegetationRevision_);
     ++revision_; ++replacement_; trafficChanges_.clear();
-    roads_.fill(0); highwayCount_=0;diagonalCount_=0;std::fill(rules_.begin(),rules_.end(),uint8_t(0)); std::fill(styles_.begin(),styles_.end(),0u);++styleRevision_; clearParcelVisuals(); count_=0;
+    clearRails();roads_.fill(0); highwayCount_=0;diagonalCount_=0;std::fill(classes_.begin(),classes_.end(),uint8_t(0));std::fill(rules_.begin(),rules_.end(),uint8_t(0)); std::fill(styles_.begin(),styles_.end(),0u);++styleRevision_; clearParcelVisuals(); count_=0;
     for(int z=0;z<MapSize;++z) for(int x=0;x<MapSize;++x) {
         bool value=scenario==2 || (scenario==1 && (x%16==0 || z%16==0));
-        roads_[z*MapSize+x]=uint8_t(value); count_+=value;
+        roads_[z*MapSize+x]=uint8_t(value);classes_[z*MapSize+x]=value?uint8_t(RoadClass::Street):0; count_+=value;
     }
     if(scenario==5){
         for(auto c:diagonalLine({254,254},{264,264}))setDiagonalRoad(c,false);
@@ -325,16 +383,16 @@ void World::generateScenario(int scenario) {
 }
 uint8_t World::roadRule(Cell c) const {return valid(c.x,c.z)?rules_[c.z*MapSize+c.x]:0;}
 void World::setRoadRule(Cell c,uint8_t rule) {
-    if(!road(c.x,c.z) || (!roundRule(rule)&&((rule&7)>4 || rule>28)))return;
-    auto& r=rules_[c.z*MapSize+c.x];if(r==rule)return;
-    if((r&HighwayRule)!=(rule&HighwayRule)){if(rule&HighwayRule)++highwayCount_;else --highwayCount_;}
+    if(!road(c.x,c.z)||!validRule(rule))return;
+    auto& r=rules_[c.z*MapSize+c.x];if(r==rule)return;bool wasHighway=highway(c);
     if(((r|rule)&HighwayRule)||roundRule(r)||roundRule(rule))for(int dz=-1;dz<=1;++dz)for(int dx=-1;dx<=1;++dx)if(valid(c.x+dx,c.z+dz))dirty_.insert((c.z+dz)/ChunkTiles*ChunksAcross+(c.x+dx)/ChunkTiles);
-    r=rule;styles_[c.z*MapSize+c.x]=(styles_[c.z*MapSize+c.x]&3)|ruleStyle(rule);++styleRevision_;++revision_;trafficChanges_.push_back(c);
+    r=rule;bool isHighway=highway(c);if(wasHighway!=isHighway){if(isHighway)++highwayCount_;else --highwayCount_;}
+    styles_[c.z*MapSize+c.x]=(styles_[c.z*MapSize+c.x]&3)|ruleStyle(rule);++styleRevision_;++revision_;trafficChanges_.push_back(c);
 }
 bool World::canTravel(Cell a,Cell b) const {
     if(!road(a.x,a.z)||!road(b.x,b.z)||std::max(std::abs(a.x-b.x),std::abs(a.z-b.z))!=1)return false;
     int direction=0;for(;direction<8;++direction)if(b==Cell{a.x+RoadDX[direction],a.z+RoadDZ[direction]})break;int d=direction+1;
-    int ra=roadRule(a)&7,rb=roadRule(b)&7;
+    int ra=roadDirection(roadRule(a)),rb=roadDirection(roadRule(b));
     if(roundRule(roadRule(a))||roundRule(roadRule(b))){
         if(!(connections(a.x,a.z)&(1<<(d-1))))return false;
         if(roundRule(roadRule(a))&&roundRule(roadRule(b))&&roundaboutOrigin(a)==roundaboutOrigin(b)) {
@@ -343,27 +401,35 @@ bool World::canTravel(Cell a,Cell b) const {
         }
         return (roundRule(roadRule(a))||ra==0||ra==d)&&(roundRule(roadRule(b))||rb==0||rb==d);
     }
-    return (connections(a.x,a.z)&(1<<(d-1)))&&(ra==0||ra==d)&&(rb==0||rb==d);
+    return (connections(a.x,a.z)&(1<<(d-1)))&&((roadRule(a)&HighwayAccessRule)||ra==0||ra==d)&&((roadRule(b)&HighwayAccessRule)||rb==0||rb==d);
 }
 void World::setParcelVisual(Cell c,ParcelVisual visual) {
-    if(!valid(c.x,c.z))return;auto& p=parcels_[c.z*MapSize+c.x];if(p==visual)return;p=visual;++parcelRevision_;
+    if(!valid(c.x,c.z))return;auto& p=parcels_[c.z*MapSize+c.x];if(p==visual)return;p=visual;++parcelRevision_;if(visual.kind)clearVegetation(c);
 }
 void World::clearParcelVisuals(){std::fill(parcels_.begin(),parcels_.end(),ParcelVisual{});++parcelRevision_;dirtyAll();}
 void World::writeRoads(std::ostream& out) const {
     out.write(reinterpret_cast<const char*>(roads_.data()),roads_.size());
     out.write(reinterpret_cast<const char*>(rules_.data()),rules_.size());
+    out.write(reinterpret_cast<const char*>(classes_.data()),classes_.size());
 }
-void World::readRoads(std::istream& in) {
+double World::roadUpkeep() const {
+    double total=0;
+    for(size_t i=0;i<classes_.size();++i)if(roads_[i]&&!(rules_[i]&HighwayRule)){auto cls=RoadClass(classes_[i]);double divisor=(cls==RoadClass::Avenue||cls==RoadClass::Highway4||cls==RoadClass::Highway6)?2:1;total+=RoadDefinitions[classes_[i]].upkeep/divisor;}
+    return total;
+}
+void World::readRoads(std::istream& in,bool hasClasses) {
     in.read(reinterpret_cast<char*>(roads_.data()),roads_.size());
     in.read(reinterpret_cast<char*>(rules_.data()),rules_.size());
+    if(hasClasses)in.read(reinterpret_cast<char*>(classes_.data()),classes_.size());
+    else {std::fill(classes_.begin(),classes_.end(),uint8_t(0));for(size_t i=0;i<roads_.size();++i)if(roads_[i])classes_[i]=uint8_t((rules_[i]&HighwayRule)?RoadClass::LegacyHighway:RoadClass::Street);}
     if(!in)throw std::runtime_error("Truncated road data");
-    for(size_t i=0;i<roads_.size();++i)if(roads_[i]>4 || (!roundRule(rules_[i])&&((rules_[i]&7)>4 || rules_[i]>28)) || (!roads_[i]&&rules_[i]))throw std::runtime_error("Invalid road data");
+    for(size_t i=0;i<roads_.size();++i)if(roads_[i]>4 || classes_[i]>uint8_t(RoadClass::Median) || (bool(roads_[i])!=(classes_[i]!=0)) || !validRule(rules_[i]) || (!roads_[i]&&rules_[i]))throw std::runtime_error("Invalid road data");
     for(int t=0;t<MapSize*MapSize;++t)if(roundRule(rules_[t])){
         Cell o=roundaboutOrigin({t%MapSize,t/MapSize});
         if(!valid(o.x,o.z)||!valid(o.x+2,o.z+2)||road(o.x+1,o.z+1))throw std::runtime_error("Invalid roundabout footprint");
         for(int i=0;i<9;++i)if(i!=4&&roadRule({o.x+i%3,o.z+i/3})!=64+i)throw std::runtime_error("Incomplete roundabout");
     }
-    highwayCount_=std::count_if(rules_.begin(),rules_.end(),[](uint8_t rule){return (rule&HighwayRule)!=0;});
+    highwayCount_=0;for(int t=0;t<MapSize*MapSize;++t)if(highway({t%MapSize,t/MapSize}))++highwayCount_;
     for(size_t i=0;i<rules_.size();++i)styles_[i]=ruleStyle(rules_[i]);++styleRevision_;
     diagonalCount_=std::count_if(roads_.begin(),roads_.end(),[](auto r){return r>=2;});count_=std::count_if(roads_.begin(),roads_.end(),[](auto r){return r!=0;});++revision_;++replacement_;trafficChanges_.clear();clearParcelVisuals();
 }
@@ -375,10 +441,10 @@ void World::generateRegionalHighway() {
     // Two separated, opposing carriageways with a flat central access junction.
     stroke({0,HighwayWestRow},{MapSize-1,HighwayWestRow},true);
     stroke({0,HighwayEastRow},{MapSize-1,HighwayEastRow},true);
-    for(int x=0;x<MapSize;++x){setRoadRule({x,HighwayWestRow},HighwayRule|4);setRoadRule({x,HighwayEastRow},HighwayRule|2);}
+    for(int x=0;x<MapSize;++x){setRoadClass({x,HighwayWestRow},RoadClass::Highway6);setRoadClass({x,HighwayEastRow},RoadClass::Highway6);setRoadRule({x,HighwayWestRow},HighwayRule|4);setRoadRule({x,HighwayEastRow},HighwayRule|2);}
     stroke({HighwayJunctionX,HighwayWestRow},{HighwayJunctionX,216},true);
-    setRoadRule({HighwayJunctionX,HighwayWestRow},HighwayRule);
-    setRoadRule({HighwayJunctionX,HighwayEastRow},HighwayRule);
+    setRoadRule({HighwayJunctionX,HighwayWestRow},HighwayRule|HighwayAccessRule);
+    setRoadRule({HighwayJunctionX,HighwayEastRow},HighwayRule|HighwayAccessRule);
 }
 
 }
@@ -387,9 +453,9 @@ namespace vc {
 std::set<int> World::changedVisualChunks(const World* previous) const {
     std::set<int> result;
     if(!previous||replacement_!=previous->replacement_) {for(int c=0;c<ChunkCount;++c)result.insert(c);return result;}
-    if(revision_==previous->revision_)return result;
+    if(revision_==previous->revision_&&railRevision_==previous->railRevision_&&closedCrossings_==previous->closedCrossings_)return result;
     for(int z=0;z<MapSize;++z)for(int x=0;x<MapSize;++x) {
-        int i=z*MapSize+x;if(roads_[i]==previous->roads_[i]&&rules_[i]==previous->rules_[i])continue;
+        int i=z*MapSize+x;if(roads_[i]==previous->roads_[i]&&rules_[i]==previous->rules_[i]&&classes_[i]==previous->classes_[i]&&rails_[i].links==previous->rails_[i].links&&rails_[i].flags==previous->rails_[i].flags&&rails_[i].height==previous->rails_[i].height&&closedCrossings_[i]==previous->closedCrossings_[i])continue;
         for(int dz=-1;dz<=1;++dz)for(int dx=-1;dx<=1;++dx)if(valid(x+dx,z+dz))result.insert(((z+dz)/ChunkTiles)*ChunksAcross+(x+dx)/ChunkTiles);
     }
     return result;

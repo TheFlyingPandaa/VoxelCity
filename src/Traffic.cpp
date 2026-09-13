@@ -60,11 +60,11 @@ struct Path {
     }
 };
 // Tile-local lane paths. Coordinates use screen-independent x/z right-hand lanes.
-Path makePath(int in,int out) {
+Path makePath(int in,int out,float laneOffset=3.f) {
     float ni=in<4?1.f:0.70710678f,no=out<4?1.f:0.70710678f;
     Point hi{DX[in]*ni,DZ[in]*ni},ho{DX[out]*no,DZ[out]*no};
-    Path p;Point a{8.f-DX[in]*8.f-hi.z*3.f,8.f-DZ[in]*8.f+hi.x*3.f};
-    Point b{8.f+DX[out]*8.f-ho.z*3.f,8.f+DZ[out]*8.f+ho.x*3.f};
+    Path p;Point a{8.f-DX[in]*8.f-hi.z*laneOffset,8.f-DZ[in]*8.f+hi.x*laneOffset};
+    Point b{8.f+DX[out]*8.f-ho.z*laneOffset,8.f+DZ[out]*8.f+ho.x*laneOffset};
     for(int i=0;i<=32;++i) {
         float t=float(i)/32,u=1-t;
         if(in==out) p.point[i]={a.x+(b.x-a.x)*t,a.z+(b.z-a.z)*t};
@@ -216,7 +216,8 @@ struct RouteSearch {
                 if(network->directed && !network->world->canTravel({tile%MapSize,tile/MapSize},{b%MapSize,b/MapSize}))continue;
                 int target=search.target;
                 if(!network->directed&&manhattan(tile,target)+manhattan(target,b)==manhattan(tile,b))b=target;
-                int g=a.g+manhattan(tile,b)*(network->purposeful&&network->world->highwayCount()&&!network->world->highway({b%MapSize,b/MapSize})?2:1)+(network->purposeful?std::min(30,(*congestion)[b]*3):0),state=b*8+d;
+                float speed=network->world->speedLimit({b%MapSize,b/MapSize});int travel=std::max(1,int(std::lround(32.f/std::max(1.f,speed))));
+                int g=a.g+manhattan(tile,b)*travel+(network->purposeful?std::min(30,(*congestion)[b]*3):0),state=b*8+d;
                 if(stamps[state]!=searchStamp || g<costs[state]) {stamps[state]=searchStamp;costs[state]=g;parent[state]=a.state;open.push({state,g,g+manhattan(b,target)});}
             }
         }
@@ -257,7 +258,7 @@ struct TrafficSimulation::Impl {
     FloatArray speedCaps; // Derived each tick; not part of the save wire format.
     struct Car {
         uint32_t id=0,route=0;unsigned bucket=0,count=0,next=1;
-        int tile=0,in=0,out=0,destination=0,held=-1;
+        int tile=0,in=0,out=0,destination=0,held=-1;uint8_t lane=0;
         float arrival=8;
         uint64_t serial=0,waiting=0,trip=0,tripOwner=0,started=0;
         bool repair=false,custom=false;
@@ -279,7 +280,7 @@ struct TrafficSimulation::Impl {
     std::shared_ptr<RouteSearch> blockingSearch;
     std::shared_ptr<std::vector<int>> blockingCongestion;
     // Movements sharing an entry always conflict, so four owner slots per tile suffice.
-    std::vector<int> heads=std::vector<int>(Cells*8,-1),owner=std::vector<int>(Cells*8,-1),winner=std::vector<int>(Cells,-1);
+    std::vector<int> heads=std::vector<int>(Cells*8*3,-1),owner=std::vector<int>(Cells*8,-1),winner=std::vector<int>(Cells,-1);
     std::vector<uint64_t> reserved=std::vector<uint64_t>(Cells);
     std::vector<uint64_t> exclusive=std::vector<uint64_t>(Cells);
     std::vector<uint8_t> unreserved=std::vector<uint8_t>(Cells);
@@ -288,7 +289,7 @@ struct TrafficSimulation::Impl {
     std::vector<int> nextCandidate,proposals,legacyTiles;
     std::vector<int> tileCount=std::vector<int>(Cells),usedTiles;
     std::vector<int> usedHeads,usedWinners;
-    std::array<Path,64> paths;
+    std::array<std::array<Path,64>,3> paths;
     std::array<std::array<Path,64>,9> roundPaths;
     std::array<uint64_t,64> conflicts;
     std::unordered_map<uint32_t,Path> detours;
@@ -305,10 +306,11 @@ struct TrafficSimulation::Impl {
     std::vector<int> result;
     std::vector<CarInstance> render;
     explicit Impl(TrafficConfig c):config(c),random(c.seed) {
-        for(int a=0;a<8;++a)for(int b=0;b<8;++b)paths[a*8+b]=makePath(a,b);
-        for(int m=0;m<64;++m)for(int k=0;k<=64;++k)paths[m].sample(paths[m].length*k/64.f,lanePoses[m][k].center,lanePoses[m][k].forward);
+        constexpr float offsets[3]={3.f,6.f,9.f};
+        for(int lane=0;lane<3;++lane)for(int a=0;a<8;++a)for(int b=0;b<8;++b)paths[lane][a*8+b]=makePath(a,b,offsets[lane]);
+        for(int m=0;m<64;++m)for(int k=0;k<=64;++k)paths[0][m].sample(paths[0][m].length*k/64.f,lanePoses[m][k].center,lanePoses[m][k].forward);
         for(int i=0;i<9;++i)for(int a=0;a<8;++a)for(int b=0;b<8;++b)roundPaths[i][a*8+b]=makeRoundPath(i,a,b);
-        static const auto sharedConflicts=movementConflicts(paths);conflicts=sharedConflicts;
+        static const auto sharedConflicts=movementConflicts(paths[0]);conflicts=sharedConflicts;
         reserve(65536);
     }
     void reserve(size_t requested) {
@@ -322,8 +324,8 @@ struct TrafficSimulation::Impl {
     static int reservation(const Car& c){return c.tile*64+movement(c);}
     void claim(int key,int id,bool custom=false){owner[key/8]=id;reserved[key/64]|=uint64_t(1ull<<(key%64));if(custom)exclusive[key/64]|=uint64_t(1ull<<(key%64));}
     void release(int key,int id){if(key>=0 && owner[key/8]==id){owner[key/8]=-1;auto keep=uint64_t(~(1ull<<(key%64)));reserved[key/64]&=keep;exclusive[key/64]&=keep;}}
-    const Path& lanePath(int tile,int in,int out)const{auto r=roadWorld->roadRule({tile%MapSize,tile/MapSize});return r>=64&&r<=72?roundPaths[r-64][in*8+out]:paths[in*8+out];}
-    const Path& path(const Car& c)const{return c.custom?detours.at(c.id):lanePath(c.tile,c.in,c.out);}
+    const Path& lanePath(int tile,int in,int out,unsigned lane=0)const{auto r=roadWorld->roadRule({tile%MapSize,tile/MapSize});return r>=64&&r<=72?roundPaths[r-64][in*8+out]:paths[std::min(2u,lane)][in*8+out];}
+    const Path& path(const Car& c)const{return c.custom?detours.at(c.id):lanePath(c.tile,c.in,c.out,c.lane);}
     int routeNext(const Car& c)const{return c.next<c.count?pool.data[c.route+c.next]:c.destination;}
     int chooseOut(int tile,int in)const {
         if(network->mask[tile]&(1<<in))return in;
@@ -350,6 +352,7 @@ struct TrafficSimulation::Impl {
     }
     bool rebuild(World& world,bool wait=false) {
         roadWorld=&world;
+        if(revision!=world.topologyRevision())holdForTopology(world);
         if(graphJob&&(graphJob->topology!=world.topologyRevision()||graphJob->replacement!=world.replacementRevision()))graphJob.reset();
         if(!graphJob) {
             auto job=std::make_unique<GraphJob>();job->topology=world.topologyRevision();job->replacement=world.replacementRevision();
@@ -398,17 +401,17 @@ struct TrafficSimulation::Impl {
         for(int t:usedTiles)tileCount[t]=0;usedTiles.clear();
         for(size_t i=0;i<cars.size();++i) {
             int tile=cars[i].tile;if(tileCount[tile]++==0)usedTiles.push_back(tile);
-            int h=cars[i].tile*8+cars[i].in;if(heads[h]<0)usedHeads.push_back(h);
+            int h=(cars[i].tile*8+cars[i].in)*3+cars[i].lane;if(heads[h]<0)usedHeads.push_back(h);
             nextCar[i]=heads[h];heads[h]=int(i);
         }
         for(size_t k=0;k<legacyTiles.size();){int tile=legacyTiles[k];bool legacy=false;
-            for(int d=0;d<8;++d)for(int i=heads[tile*8+d];i>=0;i=nextCar[i])if(owner[reservation(cars[i])/8]!=int(cars[i].id))legacy=true;
+            for(int d=0;d<8;++d)for(int lane=0;lane<3;++lane)for(int i=heads[(tile*8+d)*3+lane];i>=0;i=nextCar[i])if(owner[reservation(cars[i])/8]!=int(cars[i].id))legacy=true;
             if(legacy)++k;else {unreserved[tile]=0;legacyTiles[k]=legacyTiles.back();legacyTiles.pop_back();}
         }
     }
-    float firstPosition(int tile,int in,int exclude=-1)const {
+    float firstPosition(int tile,int in,unsigned lane=0,int exclude=-1)const {
         float value=1e9f;
-        for(int i=heads[tile*8+in];i>=0;i=nextCar[i])if(i!=exclude)value=std::min(value,hot[Progress][i]);
+        for(int i=heads[(tile*8+in)*3+std::min(2u,lane)];i>=0;i=nextCar[i])if(i!=exclude)value=std::min(value,hot[Progress][i]);
         return value;
     }
     bool occupiedJunction(int tile,int except=-1)const {
@@ -438,7 +441,7 @@ struct TrafficSimulation::Impl {
         if(!unreserved[tile])return false;
         // Edits can turn an occupied straight tile into a junction before its cars
         // have reservations. Honor their actual movements until they drain.
-        for(int d=0;d<8;++d)for(int i=heads[tile*8+d];i>=0;i=nextCar[i]){
+        for(int d=0;d<8;++d)for(int lane=0;lane<3;++lane)for(int i=heads[(tile*8+d)*3+lane];i>=0;i=nextCar[i]){
             const auto& c=cars[i];if(int(c.id)!=except && ((conflict&(1ull<<movement(c))) || c.custom))return true;
         }
         return false;
@@ -488,7 +491,7 @@ struct TrafficSimulation::Impl {
                 // connect the actual car position to its new exit without teleporting.
                 if(occupiedJunction(c.tile,int(c.id)))return;
                 Point a,h;path(c).sample(hot[Progress][i],a,h);
-                Point b=lanePath(c.tile,c.in,nextOut).point.back();
+                Point b=lanePath(c.tile,c.in,nextOut,c.lane).point.back();
                 float handle=std::min(4.f,std::hypot(b.x-a.x,b.z-a.z)*.4f);
                 Point controlA{std::clamp(a.x+h.x*handle,3.f,13.f),std::clamp(a.z+h.z*handle,3.f,13.f)};
                 Point controlB{b.x-DX[nextOut]*handle,b.z-DZ[nextOut]*handle};Path detour;
@@ -511,17 +514,18 @@ struct TrafficSimulation::Impl {
         if(!(network->mask[tile]&(1<<(oppositeDirection(in))))) {
             for(int d=0;d<8;++d)if(network->mask[tile]&(1<<d)){in=oppositeDirection(d);if(in!=oppositeDirection(out))break;}
         }
-        const auto& p=lanePath(tile,in,out);
+        unsigned lane=std::min(2u,unsigned(random()%std::max(1u,roadWorld->lanesPerDirection({tile%MapSize,tile/MapSize}))));
+        const auto& p=lanePath(tile,in,out,lane);
         float progress=4.f+float(random()%10000)/10000.f*std::max(0.f,p.length-8.f);
         if(junction(tile) && occupiedMovement(tile,in,out))return;
-        for(int i=heads[tile*8+in];i>=0;i=nextCar[i])if(std::abs(hot[Progress][i]-progress)<Gap)return;
+        for(int i=heads[(tile*8+in)*3+lane];i>=0;i=nextCar[i])if(std::abs(hot[Progress][i]-progress)<Gap)return;
         // Also check neighboring lane tails so random insertion never cuts off a car.
         int prev=neighbor(tile,oppositeDirection(in));
-        if(prev>=0)for(int d=0;d<8;++d)for(int i=heads[prev*8+d];i>=0;i=nextCar[i])
+        if(prev>=0)for(int d=0;d<8;++d)for(int otherLane=0;otherLane<3;++otherLane)for(int i=heads[(prev*8+d)*3+otherLane];i>=0;i=nextCar[i])
             if(cars[i].out==in && path(cars[i]).length-hot[Progress][i]+progress<Gap)return;
         int next=neighbor(tile,out);
-        if(next>=0 && p.length-progress+firstPosition(next,out)<Gap)return;
-        reserve(cars.size()+1);Car c;c.tile=tile;c.in=in;c.out=out;c.destination=search.target;c.serial=++serial;
+        if(next>=0 && p.length-progress+firstPosition(next,out,lane)<Gap)return;
+        reserve(cars.size()+1);Car c;c.tile=tile;c.in=in;c.out=out;c.destination=search.target;c.serial=++serial;c.lane=uint8_t(lane);
         c.trip=searching.id;c.tripOwner=searching.owner;c.started=stats.ticks;searching={};
         c.arrival=4.f+float(random()%8000)/1000.f;
         if(freeIds.empty()){c.id=uint32_t(slots.size());slots.push_back(-1);}else {c.id=uint32_t(freeIds.back());freeIds.pop_back();}
@@ -530,7 +534,7 @@ struct TrafficSimulation::Impl {
         if(tileCount[tile]++==0)usedTiles.push_back(tile);
         for(auto& a:hot)a[i]=0;hot[Progress][i]=progress;position(i,true);
         if(junction(tile))claim(reservation(c),int(c.id));
-        int h=tile*8+in;if(heads[h]<0)usedHeads.push_back(h);nextCar[i]=heads[h];heads[h]=int(i);
+        int h=(tile*8+in)*3+c.lane;if(heads[h]<0)usedHeads.push_back(h);nextCar[i]=heads[h];heads[h]=int(i);
     }
     void routeWork() {
         if(searching.id){requests.push_front(searching);searching={};}
@@ -624,10 +628,10 @@ struct TrafficSimulation::Impl {
             float length=path(c).length,limit=1e6f;
             if(c.tile==c.destination)limit=std::max(0.f,std::min(c.arrival,length-Half)-hot[Progress][i]);
             bool front=true;
-            for(int j=heads[c.tile*8+c.in];j>=0;j=nextCar[j])if(hot[Progress][j]>hot[Progress][i]){front=false;limit=std::min(limit,hot[Progress][j]-hot[Progress][i]-Gap);}
+            for(int j=heads[(c.tile*8+c.in)*3+c.lane];j>=0;j=nextCar[j])if(hot[Progress][j]>hot[Progress][i]){front=false;limit=std::min(limit,hot[Progress][j]-hot[Progress][i]-Gap);}
             int next=neighbor(c.tile,c.out);
             if(c.repair || next<0){hot[Limit][i]=0;continue;}
-            limit=std::min(limit,length-hot[Progress][i]+firstPosition(next,c.out)-Gap);
+            limit=std::min(limit,length-hot[Progress][i]+firstPosition(next,c.out,c.lane)-Gap);
             hot[Limit][i]=std::max(0.f,limit);
             if(c.tile==c.destination || !front || !junction(next) || length-hot[Progress][i]>20)continue;
             if(!c.waiting)c.waiting=stats.ticks;
@@ -635,10 +639,10 @@ struct TrafficSimulation::Impl {
             Car future=c;future.tile=next;future.in=c.out;
             if(future.next<future.count && next==pool.data[future.route+future.next])++future.next;
             future.out=next==c.destination?chooseOut(next,future.in):direction(next,routeNext(future));
-            if(world.roadRule({next%MapSize,next/MapSize})<64 && (world.roadRule({next%MapSize,next/MapSize})&8) && ((stats.ticks/180)%2 != unsigned(future.in%2)))continue;
+            {auto rule=world.roadRule({next%MapSize,next/MapSize});bool signaled=(rule&ExtendedDirectionRule)?(rule&64)!=0:rule<64&&(rule&8)!=0;if(signaled&&((stats.ticks/180)%2 != unsigned(future.in%2)))continue;}
             if(occupiedMovement(next,future.in,future.out,int(c.id)))continue;
             int exit=neighbor(next,future.out);
-            if(next!=c.destination && (exit<0 || firstPosition(exit,future.out)<Gap))continue;
+            if(next!=c.destination && (exit<0 || firstPosition(exit,future.out,future.lane)<Gap))continue;
             requestedMovement[i]=uint8_t(movement(future));
             if(winner[next]<0)usedWinners.push_back(next);
             nextCandidate[i]=winner[next];winner[next]=int(i);
@@ -665,10 +669,10 @@ struct TrafficSimulation::Impl {
         }
         for(size_t i=0;i<cars.size();++i) {
             auto& c=cars[i];int next=neighbor(c.tile,c.out);
-            if(c.tile!=c.destination && next>=0 && junction(next) && !admitted[i])hot[Limit][i]=std::min(hot[Limit][i],std::max(0.f,path(c).length-hot[Progress][i]-Half));
+            if(c.tile!=c.destination && next>=0 && ((junction(next) && !admitted[i])||world.crossingClosed({next%MapSize,next/MapSize})))hot[Limit][i]=std::min(hot[Limit][i],std::max(0.f,path(c).length-hot[Progress][i]-Half));
         }
         for(size_t i=0;i<cars.size();++i){const auto& c=cars[i];int next=neighbor(c.tile,c.out);
-            speedCaps[i]=world.highway({c.tile%MapSize,c.tile/MapSize})&&!junction(c.tile)&&next>=0&&!junction(next)?32.f:16.f;}
+            speedCaps[i]=!junction(c.tile)&&next>=0&&!junction(next)?world.speedLimit({c.tile%MapSize,c.tile/MapSize}):std::min(16.f,world.speedLimit({c.tile%MapSize,c.tile/MapSize}));}
         integrateCars(cars.size(),Dt,hot[Speed].data,hot[Limit].data,hot[Distance].data,speedCaps.data);
         // Lifecycle and path transitions are sparse scalar work; position storage stays SoA.
         for(size_t i=0;i<cars.size();++i) {
@@ -679,7 +683,7 @@ struct TrafficSimulation::Impl {
                     hot[Progress][i]=std::max(0.f,hot[Progress][i]-path(c).length);
                     if(owner[reservation(c)/8]==int(c.id))c.held=reservation(c);
                     if(c.custom){detours.erase(c.id);c.custom=false;}
-                    c.tile=next;c.in=c.out;c.waiting=0;
+                    c.tile=next;c.in=c.out;c.waiting=0;c.lane=uint8_t(std::min(unsigned(c.lane),std::max(1u,world.lanesPerDirection({next%MapSize,next/MapSize}))-1));
                     if(c.next<c.count && c.tile==pool.data[c.route+c.next])++c.next;
                     c.out=c.tile==c.destination?chooseOut(c.tile,c.in):direction(c.tile,routeNext(c));
                     if(junction(next))claim(reservation(c),int(c.id));
@@ -728,7 +732,7 @@ void TrafficSimulation::update(World& w,double seconds) {
 }
 std::span<const CarInstance> TrafficSimulation::instances() {
     auto& s=*impl_;s.render.resize(s.cars.size());float alpha=paused || !s.interpolate?1.f:float(s.accumulator*30);
-    for(size_t i=0;i<s.cars.size();++i)s.render[i]={s.hot[Impl::PX][i]+(s.hot[Impl::X][i]-s.hot[Impl::PX][i])*alpha,s.hot[Impl::PZ][i]+(s.hot[Impl::Z][i]-s.hot[Impl::PZ][i])*alpha,s.hot[Impl::HX][i],s.hot[Impl::HZ][i],uint32_t(s.cars[i].serial%6),s.cars[i].serial};
+    for(size_t i=0;i<s.cars.size();++i)s.render[i]={s.hot[Impl::PX][i]+(s.hot[Impl::X][i]-s.hot[Impl::PX][i])*alpha,s.hot[Impl::PZ][i]+(s.hot[Impl::Z][i]-s.hot[Impl::PZ][i])*alpha,s.hot[Impl::HX][i],s.hot[Impl::HZ][i],uint32_t(s.cars[i].serial%6),s.cars[i].serial,s.cars[i].lane};
     return s.render;
 }
 void TrafficSimulation::validate(const World& w)const {
@@ -736,17 +740,20 @@ void TrafficSimulation::validate(const World& w)const {
     std::vector<std::pair<int,size_t>> ordered;
     for(size_t i=0;i<s.cars.size();++i) {
         const auto& c=s.cars[i];
-        if(s.slots[c.id]!=int(i) || !w.road(c.tile%MapSize,c.tile/MapSize) || !std::isfinite(s.hot[Impl::X][i]) || s.hot[Impl::Speed][i]<0 || s.hot[Impl::Speed][i]>(w.highway({c.tile%MapSize,c.tile/MapSize})?32.001f:16.001f) || c.next>c.count)
-            throw std::runtime_error("Traffic state invariant failed");
-        ordered.push_back({c.tile*8+c.in,i});
+        if(s.slots[c.id]!=int(i))throw std::runtime_error("Traffic slot invariant failed");
+        if(!w.road(c.tile%MapSize,c.tile/MapSize))throw std::runtime_error("Traffic road invariant failed at "+std::to_string(c.tile%MapSize)+","+std::to_string(c.tile/MapSize));
+        if(c.lane>=w.lanesPerDirection({c.tile%MapSize,c.tile/MapSize}))throw std::runtime_error("Traffic lane invariant failed");
+        if(!std::isfinite(s.hot[Impl::X][i])||s.hot[Impl::Speed][i]<0||s.hot[Impl::Speed][i]>w.speedLimit({c.tile%MapSize,c.tile/MapSize})+.001f)throw std::runtime_error("Traffic motion invariant failed");
+        if(c.next>c.count)throw std::runtime_error("Traffic route invariant failed");
+        ordered.push_back({(c.tile*8+c.in)*3+c.lane,i});
     }
     std::sort(ordered.begin(),ordered.end(),[&](auto a,auto b){return a.first!=b.first?a.first<b.first:s.hot[Impl::Progress][a.second]<s.hot[Impl::Progress][b.second];});
     for(size_t k=1;k<ordered.size();++k)if(ordered[k].first==ordered[k-1].first && s.hot[Impl::Progress][ordered[k].second]-s.hot[Impl::Progress][ordered[k-1].second]<Gap-.01f)
         throw std::runtime_error("Cars violated lane following gap");
-    std::vector<float> first(Cells*8,1e9f);
+    std::vector<float> first(Cells*8*3,1e9f);
     for(const auto& entry:ordered)first[entry.first]=std::min(first[entry.first],s.hot[Impl::Progress][entry.second]);
     for(size_t i=0;i<s.cars.size();++i){const auto& c=s.cars[i];int next=neighbor(c.tile,c.out);
-        if(next>=0 && s.path(c).length-s.hot[Impl::Progress][i]+first[next*8+c.out]<Gap-.01f)
+        if(next>=0 && s.path(c).length-s.hot[Impl::Progress][i]+first[(next*8+c.out)*3+c.lane]<Gap-.01f)
             throw std::runtime_error("Cars violated gap across tile boundary");}
     for(int tile=0;tile<Cells;++tile){uint64_t bits=s.reserved[tile];
         while(bits){int m=std::countr_zero(bits);bits&=bits-1;int key=tile*64+m,id=s.owner[key/8];
@@ -760,7 +767,7 @@ void TrafficSimulation::validate(const World& w)const {
 }
 std::vector<TrafficCarState> TrafficSimulation::debugSnapshot()const {
     const auto& s=*impl_;std::vector<TrafficCarState> result;result.reserve(s.cars.size());
-    for(size_t i=0;i<s.cars.size();++i){const auto& c=s.cars[i];result.push_back({c.serial,{c.tile%MapSize,c.tile/MapSize},{c.destination%MapSize,c.destination/MapSize},s.hot[Impl::X][i],s.hot[Impl::Z][i],s.hot[Impl::Speed][i],c.repair});}
+    for(size_t i=0;i<s.cars.size();++i){const auto& c=s.cars[i];result.push_back({c.serial,{c.tile%MapSize,c.tile/MapSize},{c.destination%MapSize,c.destination/MapSize},s.hot[Impl::X][i],s.hot[Impl::Z][i],s.hot[Impl::Speed][i],c.repair,c.lane});}
     return result;
 }
 bool TrafficSimulation::requestTrip(TripRequest request) {
@@ -775,7 +782,7 @@ std::vector<uint64_t> TrafficSimulation::ownedTripIds()const {
 void TrafficSimulation::swap(TrafficSimulation& other) noexcept {impl_.swap(other.impl_);std::swap(paused,other.paused);}
 void TrafficSimulation::saveState(std::ostream& out) const {
     using namespace binary;const auto& s=*impl_;
-    write(out,uint32_t(3));write(out,s.config.seed);write(out,s.stats.ticks);write(out,s.stats.completed);write(out,s.stats.removed);write(out,s.serial);
+    write(out,uint32_t(4));write(out,s.config.seed);write(out,s.stats.ticks);write(out,s.stats.completed);write(out,s.stats.removed);write(out,s.serial);
     std::ostringstream rng;rng<<s.random;text(out,rng.str());
     auto request=[&](const TripRequest& r){write(out,r.id);write(out,r.owner);write(out,r.from.x);write(out,r.from.z);write(out,r.to.x);write(out,r.to.z);write(out,r.kind);};
     request(s.searching);auto pending=s.requests;if(s.routeJob)for(auto& input:s.routeJob->pending)if(input.trip.id)pending.push_back(input.trip);
@@ -785,7 +792,7 @@ void TrafficSimulation::saveState(std::ostream& out) const {
     write(out,uint32_t(s.cars.size()));
     for(size_t i=0;i<s.cars.size();++i){const auto& c=s.cars[i];
         write(out,c.id);write(out,c.route);write(out,c.bucket);write(out,c.count);write(out,c.next);
-        write(out,c.tile);write(out,c.in);write(out,c.out);write(out,c.destination);write(out,c.held);write(out,c.arrival);
+        write(out,c.tile);write(out,c.in);write(out,c.out);write(out,c.destination);write(out,c.held);write(out,c.lane);write(out,c.arrival);
         write(out,c.serial);write(out,c.waiting);write(out,c.trip);write(out,c.tripOwner);write(out,c.started);write(out,uint8_t(c.repair));write(out,uint8_t(c.custom));
         for(const auto& a:s.hot)write(out,a[i]);
         if(c.custom){const auto& p=s.detours.at(c.id);for(auto v:p.point){write(out,v.x);write(out,v.z);}for(auto v:p.distance)write(out,v);write(out,p.length);}
@@ -795,7 +802,7 @@ void TrafficSimulation::saveState(std::ostream& out) const {
 }
 void TrafficSimulation::loadState(std::istream& in,World& world) {
     using namespace binary;
-    auto version=read<uint32_t>(in);if(version!=1&&version!=2&&version!=3)throw std::runtime_error("Unsupported traffic state");
+    auto version=read<uint32_t>(in);if(version<1||version>4)throw std::runtime_error("Unsupported traffic state");
     auto seed=read<uint32_t>(in);auto next=std::make_unique<Impl>(TrafficConfig{0,seed,20000,64,true});auto& s=*next;s.rebuild(world,true);
     s.stats.ticks=read<uint64_t>(in);s.stats.completed=read<uint64_t>(in);s.stats.removed=read<uint64_t>(in);s.serial=read<uint64_t>(in);
     std::istringstream rng(text(in));if(!(rng>>s.random))throw std::runtime_error("Invalid traffic random state");
@@ -807,10 +814,10 @@ void TrafficSimulation::loadState(std::istream& in,World& world) {
     vector(in,s.slots,1000000);vector(in,s.freeIds,1000000);vector(in,s.pool.data,64000000);for(auto& f:s.pool.free)vector(in,f,1000000);
     auto n=count(1000000);s.reserve(n);s.cars.resize(n);
     for(size_t i=0;i<n;++i){auto& c=s.cars[i];c.id=read<uint32_t>(in);c.route=read<uint32_t>(in);c.bucket=read<unsigned>(in);c.count=read<unsigned>(in);c.next=read<unsigned>(in);
-        c.tile=read<int>(in);c.in=read<int>(in);c.out=read<int>(in);c.destination=read<int>(in);c.held=read<int>(in);c.arrival=read<float>(in);
+        c.tile=read<int>(in);c.in=read<int>(in);c.out=read<int>(in);c.destination=read<int>(in);c.held=read<int>(in);if(version>=4)c.lane=read<uint8_t>(in);c.arrival=read<float>(in);
         if(version==1&&c.held>=0){int movement=c.held%16;c.held=(c.held/16)*64+(movement/4)*8+movement%4;}
         c.serial=read<uint64_t>(in);c.waiting=read<uint64_t>(in);c.trip=read<uint64_t>(in);c.tripOwner=read<uint64_t>(in);c.started=read<uint64_t>(in);c.repair=read<uint8_t>(in)!=0;c.custom=read<uint8_t>(in)!=0;
-        if(c.id>=s.slots.size() || c.bucket>=20 || uint64_t(c.route)+(uint64_t(1)<<c.bucket)>s.pool.data.size() || c.count>(1u<<c.bucket) || c.next>c.count || c.tile<0 || c.tile>=Cells || c.destination<0 || c.destination>=Cells || c.in<0 || c.in>7 || c.out<0 || c.out>7 || c.held < -1 || c.held>=Cells*64 || !std::isfinite(c.arrival))throw std::runtime_error("Invalid saved vehicle");
+        if(c.id>=s.slots.size() || c.bucket>=20 || uint64_t(c.route)+(uint64_t(1)<<c.bucket)>s.pool.data.size() || c.count>(1u<<c.bucket) || c.next>c.count || c.tile<0 || c.tile>=Cells || c.destination<0 || c.destination>=Cells || c.in<0 || c.in>7 || c.out<0 || c.out>7 || c.lane>2 || c.held < -1 || c.held>=Cells*64 || !std::isfinite(c.arrival))throw std::runtime_error("Invalid saved vehicle");
         for(auto& a:s.hot){a[i]=read<float>(in);if(!std::isfinite(a[i]))throw std::runtime_error("Invalid vehicle position");}
         if(c.custom){auto& p=s.detours[c.id];for(auto& v:p.point){v.x=read<float>(in);v.z=read<float>(in);}for(auto& v:p.distance)v=read<float>(in);p.length=read<float>(in);if(!std::isfinite(p.length)||p.length<=0)throw std::runtime_error("Invalid detour");}
     }

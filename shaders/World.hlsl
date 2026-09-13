@@ -18,8 +18,8 @@ Pixel vsMain(Input v) {
     return o;
 }
 float4 psMain(Pixel p):SV_TARGET {
-    float3 colors[16]={float3(0.23,0.36,0.24),float3(0.105,0.13,0.155),float3(0.91,0.84,0.57),float3(0.56,0.61,0.59),float3(0.40,0.43,0.42),float3(0.25,0.65,0.38),float3(0.20,0.48,0.78),float3(0.78,0.56,0.18),float3(0.45,0.70,0.72),float3(0.65,0.42,0.65),float3(0.25,0.28,0.32),float3(0.8,0.88,0.72),float3(0.85,0.16,0.13),float3(0.2,0.8,0.35),float3(0.95,0.65,0.15),float3(0.20,0.22,0.24)};
-    float3 color=colors[min(p.material,15u)];
+    float3 colors[18]={float3(0.23,0.36,0.24),float3(0.105,0.13,0.155),float3(0.91,0.84,0.57),float3(0.56,0.61,0.59),float3(0.40,0.43,0.42),float3(0.25,0.65,0.38),float3(0.20,0.48,0.78),float3(0.78,0.56,0.18),float3(0.45,0.70,0.72),float3(0.65,0.42,0.65),float3(0.25,0.28,0.32),float3(0.8,0.88,0.72),float3(0.85,0.16,0.13),float3(0.2,0.8,0.35),float3(0.95,0.65,0.15),float3(0.20,0.22,0.24),float3(.25,.13,.055),float3(.11,.22,.065)};
+    float3 color=colors[min(p.material,17u)];
     uint2 tile=min(uint2(p.world.xz/options.y),511u);
     uint style=tileStyles[tile.y*512+tile.x],tint=style&3u,rule=style>>2;
     if(tint)color=lerp(color,tint==1?float3(0.85,0.12,0.10):tint==2?float3(0.95,0.6,0.12):float3(0.12,0.8,0.3),0.65);

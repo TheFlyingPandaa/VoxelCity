@@ -3,12 +3,12 @@ cbuffer Scene : register(b0) {
     float4 chunkOffset, eye, hover, sunlight, options;
 };
 RaytracingAccelerationStructure scene : register(t0);
-struct Input {float3 position:POSITION;float3 normal:NORMAL;uint material:MATERIAL;float4 instance:INSTANCE;uint color:COLOR;};
+struct Input {float3 position:POSITION;float3 normal:NORMAL;uint material:MATERIAL;float4 instance:INSTANCE;uint color:COLOR;float height:HEIGHT;};
 struct Pixel {float4 position:SV_POSITION;float3 world:WORLD;float3 normal:NORMAL;nointerpolation uint material:MATERIAL;nointerpolation uint color:COLOR;};
 Pixel vsMain(Input v) {
     Pixel p;float2 forward=normalize(v.instance.zw),right=float2(forward.y,-forward.x);
     float2 xz=v.instance.xy+right*v.position.x+forward*v.position.z;
-    p.world=float3(xz.x,v.position.y,xz.y);p.position=mul(float4(p.world,1),viewProjection);
+    p.world=float3(xz.x,v.position.y+v.height,xz.y);p.position=mul(float4(p.world,1),viewProjection);
     float2 n=right*v.normal.x+forward*v.normal.z;p.normal=float3(n.x,v.normal.y,n.y);
     p.material=v.material;p.color=v.color;return p;
 }
@@ -18,6 +18,7 @@ float4 psMain(Pixel p):SV_TARGET {
     if(p.material==1)color=float3(.12,.22,.28);
     if(p.material==2)color=float3(.04,.05,.06);
     if(p.material==3)color=float3(.95,.95,.7);
+    if(p.material==4)color=float3(.65,.67,.65);
     float3 light=normalize(sunlight.xyz);float ndl=saturate(dot(p.normal,light)),visible=1;
     if(options.x>.5 && ndl>0) {
         RayDesc ray;ray.Origin=p.world+p.normal*.015;ray.Direction=light;ray.TMin=.001;ray.TMax=options.w*2;

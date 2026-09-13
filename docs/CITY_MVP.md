@@ -5,33 +5,34 @@
 | Area | Behavior |
 |---|---|
 | City state | Headless fixed-tick simulation, stable IDs, households, workplaces, seeded growth and persistent trip ownership |
-| Construction | Priced atomic road strokes, RCI zoning, one-tile facilities, demolition, occupancy checks, one-way rules and signals |
+| Construction | Priced atomic road strokes, eight-direction roads, road classes and wider footprints, fixed roundabouts/interchanges, low/high residential and commercial zoning, industry and service/rail facilities, demolition, occupancy checks, one-way rules and signals |
 | Development | Migration, jobs, RCI demand, two building levels, service/land-value requirements, deterioration, abandonment and recovery |
 | Economy | RCI tax controls, periodic financial ledger, upkeep, trade payments, one emergency loan, insolvency handling and sandbox |
 | Utilities | Electricity, water and sewage capacity per connected road component, with proportional shortages |
 | Services | Garbage, clinic and fire dispatch; road-distance police, school and park coverage; bounded waste, health, fire, crime and education |
 | Environment | Local industry/waste/power pollution, local traffic pressure/noise, happiness and land value |
 | Traffic | Sampled household commutes, inventory-carrying freight, service trips, endpoint callbacks, congestion-weighted routing and commuting productivity |
+| Railway | Protected regional passenger/freight trains, stations, terminals, depots, automatic local shuttles and transfers, crossings and a fixed highway overpass |
 | Interface | Construction categories, city overview, budget/demand controls, service and condition overlays, inspection, progression guide and time controls |
-| Persistence | Checked v4 city saves, v3 city compatibility, v1/v2 imports, complete active routing/vehicle state, paused-edit reconciliation, atomic file replacement, rotating autosaves and exit protection |
+| Persistence | Checked v7 city saves with density, permanent tree clearing and railway/train state, v4 traffic payload, v3-v6 city compatibility, v1/v2 imports, complete active routing/vehicle state, paused-edit reconciliation, atomic file replacement, rotating autosaves and exit protection |
 | Rendering | Instanced procedural buildings, shared BLAS, distance-based window detail, building shadows, GPU overlays and asynchronous large road rebuilds |
 | Delivery | Starter/town/metropolis fixtures, automated city input tests, growth and stress runners, local Windows package script |
 
-The agreed scope remains CS1's core management loop for a small-team voxel game. It does not claim original-game feature breadth or production content polish. Public transport, curved/elevated roads, terrain editing, districts, high-density zoning, specialist industries and individual citizen lifecycles remain outside this release.
+The agreed scope remains CS1's core management loop for a small-team voxel game. It does not claim original-game feature breadth or production content polish. Manual transit lines, additional transport modes, general curved/elevated roads, terrain editing, districts, specialist industries and individual citizen lifecycles remain outside this release. See [density and roads](DENSITY_AND_ROADS.md), [railway](RAILWAY.md) and the [future parity roadmap](CITIES_SKYLINES_2_PARITY_PLAN.md).
 
 ## Regional highway addition
 
-New city maps and scenarios now include a protected east-west highway between Westhaven and Eastbridge, with opposing carriageways, shoulders, a grass median and a flat central access junction. It carries seeded through traffic immediately and replenishes traffic at the appropriate outside entrances. Imports and exports choose valid inbound and outbound endpoints. Existing city saves keep their layout; v3 remains loadable and new saves use v4 without changing the traffic payload format.
+New city maps and scenarios now include a protected east-west highway between Westhaven and Eastbridge, with opposing carriageways, shoulders, a grass median and a fixed central access interchange. It carries seeded through traffic immediately and replenishes traffic at the appropriate outside entrances. Imports and exports choose valid inbound and outbound endpoints. Existing city saves keep their layout; v3-v6 remain loadable and new saves use v7 with traffic payload v4.
 
-The new-map highway capture was visually inspected (`artifacts/highway-default.bmp`) and the rendered run reported zero DirectX errors. Debug and Release pass all four test executables; the city UI and 1×/3× stress scripts also pass.
+The new-map highway capture was visually inspected (`artifacts/highway-default.bmp`) and the rendered run reported zero DirectX errors. At the time of the highway validation, Debug and Release passed the then-current four test executables; the city UI and 1×/3× stress scripts also pass.
 
 `HighwayTests` covers regional ownership, atomic rejection of highway demolition, shoulder access restrictions, local-road frontage, highway speeds, all four neighboring-city trade directions, gameplay imports, deterministic active-trip save/resume and legacy v3 loading.
 
 ## Acceptance evidence
 
-Validated locally on Windows with a Ryzen 9 5900X and RTX 4070.
+The results in this section are historical, collected on Windows with a Ryzen 9 5900X and RTX 4070; they have not been rerun for the current density/railway working tree. See [BASE-01](BASELINE.md) for the current source snapshot and fresh test results.
 
-- Debug and Release builds run `WorldTests`, `TrafficTests` and `CityTests`.
+- The current build helper runs nine CTest targets in Debug and Release: `WorldTests`, `TrafficTests`, `CityTests`, `VegetationTests`, `HighwayTests`, `VoxelTests`, `VoxelGpuTests`, `ThreadingTests` and `RailwayTests`.
 - City tests cover priced command atomicity, occupancy and unlock checks, demand/growth, utility cuts and recovery, saved-state determinism, corruption rollback, legacy imports, duplicate trip rejection, directed travel, road-edit failures, pause/speed behavior and bypass travel time.
 - A paused-edit save regression deletes a road occupied by a vehicle, saves without advancing time, reloads and validates the resulting traffic state.
 - `CityTests growth` builds roads, zones and facilities with normal priced commands from $100,000. The city reaches **10,000 residents**, then maintains positive income at that population for **30 consecutive financial periods**. Result: `artifacts/city-growth.txt`.
@@ -60,7 +61,7 @@ Stress trips run in an additional grid adjoining the city. The runner waits for 
 
 Households provide grouped population and workforce, with sampled commutes and a single goods commodity. Municipal import/export transactions occur at delivery and are separate from the recurring operating balance. Coverage services use road distance; dispatched facilities have four concurrent vehicles. Road-component utility distribution does not require pipes, wires or fluid simulation. New buildings use procedural geometry rather than a production asset library.
 
-The existing ray-tracing hardware requirement is retained. Map startup may still perform synchronous initial meshing; large later changes use background batches, so updated road geometry can appear progressively. City rule evaluation remains single-threaded and deterministic at fixed ticks; sub-tick display interpolation resets on load.
+The existing ray-tracing hardware requirement is retained. Map startup may still perform synchronous initial meshing; large later changes use background batches, so updated road geometry can appear progressively. City rule evaluation remains single-threaded; normal asynchronous worker completion can change trip timing. Headless correctness tests drain worker jobs for reproducibility. Sub-tick display interpolation resets on load. See [threading](THREADING.md).
 
 ## Reproduce
 
