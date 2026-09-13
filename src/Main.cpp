@@ -487,6 +487,11 @@ int run(HINSTANCE instance) {
             <<",\n  \"traffic_pending\": "<<traffic.stats().pending<<", \"completed_trips\": "<<traffic.stats().completed<<", \"traffic_memory_mib\": "<<double(traffic.stats().memoryBytes)/(1024*1024)
             <<",\n  \"rail_trains\": "<<city.railway.trains().size()<<", \"rail_passengers\": "<<city.railway.stats().passengers<<", \"rail_cargo\": "<<city.railway.stats().cargo
             <<",\n  \"city_population\": "<<city.stats().population<<", \"city_tick_ms\": "<<city.stats().tickMs<<", \"city_balance\": "<<city.stats().balance
+            <<",\n  \"city_measured_ticks\": "<<city.performance().ticks<<", \"city_measured_steps\": "<<city.performance().steps<<", \"city_deferred_steps\": "<<city.performance().deferredSteps
+            <<",\n  \"city_subsystem_total_ms\": {\"access\": "<<city.performance().accessMs<<", \"rail\": "<<city.performance().railMs<<", \"traffic\": "<<city.performance().trafficMs
+            <<", \"events\": "<<city.performance().eventsMs<<", \"services\": "<<city.performance().servicesMs<<", \"employment\": "<<city.performance().employmentMs
+            <<", \"development\": "<<city.performance().developmentMs<<", \"dispatch\": "<<city.performance().dispatchMs<<", \"finance\": "<<city.performance().financeMs<<", \"publish\": "<<city.performance().publishMs<<"}"
+            <<",\n  \"route_batch_age_ms\": "<<traffic.stats().routeBatchAgeMs
             <<",\n  \"traffic_seed\": "<<config.trafficSeed<<", \"traffic_warmup_seconds\": "<<trafficWarmupSeconds
             <<",\n  \"debug_errors\": "<<app.renderer->stats.debugErrors<<", \"total_seconds\": "<<std::chrono::duration<double>(Clock::now()-start).count()<<",\n  \"rendered_frames\": "<<app.renderer->presented<<", \"replaced_frames\": "<<app.renderer->dropped
             <<",\n  \"presentation_average_ms\": "<<app.renderer->frameAverageMs<<", \"presentation_p95_ms\": "<<app.renderer->frameP95Ms

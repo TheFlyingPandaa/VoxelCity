@@ -17,6 +17,17 @@ int main(int argc,char** argv) try {
     struct Cleanup {std::filesystem::path path;~Cleanup(){std::error_code ec;std::filesystem::remove_all(path,ec);}}cleanup{folder};
     {
         auto map=std::make_unique<World>();CitySimulation c;TrafficSimulation sim({0,42,20000,64,true});
+        c.scenario(*map,sim,500);c.resetPerformance();advance(c,*map,sim,60);
+        CHECK(c.performance().ticks==60);
+        CHECK(c.performance().steps+c.performance().deferredSteps==2);
+        c.save(*map,sim,folder/"metrics-before.vcity");auto ticks=c.ticks();
+        c.resetPerformance();CHECK(c.performance().ticks==0);CHECK(c.performance().steps==0);
+        CHECK(c.performance().trafficMs==0);CHECK(c.ticks()==ticks);
+        c.save(*map,sim,folder/"metrics-after.vcity");
+        CHECK(bytes(folder/"metrics-before.vcity")==bytes(folder/"metrics-after.vcity"));
+    }
+    {
+        auto map=std::make_unique<World>();CitySimulation c;TrafficSimulation sim({0,42,20000,64,true});
         CHECK(!c.buildRoundabout(*map,{511,511},message));
         c.treasury=159;CHECK(!c.buildRoundabout(*map,{20,20},message));CHECK(map->roadCount()==0);
         c.treasury=1000;CHECK(c.buildRoundabout(*map,{20,20},message));CHECK(c.treasury==840);CHECK(map->roadCount()==8);

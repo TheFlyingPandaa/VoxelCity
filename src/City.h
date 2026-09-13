@@ -40,6 +40,12 @@ struct Building {
 };
 struct Household {uint64_t id=0,home=0,workplace=0;int members=0;float commuteQuality=1,travelSeconds=0;};
 struct CityTrip {uint64_t id=0,source=0,destination=0,household=0;uint8_t kind=0;int cargo=0;uint64_t requested=0;};
+// Diagnostic wall-clock costs only; never serialized or used for simulation decisions.
+struct CityPerformance {
+    uint64_t ticks=0,steps=0,deferredSteps=0;
+    double accessMs=0,railMs=0,trafficMs=0,eventsMs=0;
+    double servicesMs=0,employmentMs=0,developmentMs=0,dispatchMs=0,financeMs=0,publishMs=0;
+};
 struct CityStats {
     int population=0,jobs=0,employed=0,milestone=0;
     double income=0,expenses=0,balance=0,tickMs=0,averageTripSeconds=0;
@@ -54,6 +60,8 @@ public:
     const std::vector<Building>& buildings() const {return buildings_;}
     const std::vector<Household>& households() const {return households_;}
     const CityStats& stats() const {return stats_;}
+    const CityPerformance& performance() const {return performance_;}
+    void resetPerformance() {performance_={};}
     const BuildingDefinition& definition(BuildingKind k) const {return definitions_.at(size_t(k));}
     const Building* at(Cell c) const;
     const Building* find(uint64_t id) const;
@@ -106,6 +114,7 @@ private:
     struct RailExport {uint64_t source=0,terminal=0,train=0;int amount=0;};
     std::vector<RailExport> railExports_;
     CityStats stats_;
+    CityPerformance performance_;
     std::vector<float> roadPressure_=std::vector<float>(MapSize*MapSize);
     uint64_t ticks_=0,nextId_=1,nextTrip_=1,topology_=~uint64_t(0);
     uint32_t random_=42;

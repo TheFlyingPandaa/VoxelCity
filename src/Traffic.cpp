@@ -1,4 +1,5 @@
 #include "Traffic.h"
+#include "RoadNetwork.h"
 #include "NetworkWorker.h"
 #include "Binary.h"
 #include <deque>
@@ -154,6 +155,7 @@ void integrateCars(size_t count,float dt,float* speed,const float* limit,float* 
 }
 struct TrafficGraph {
     std::shared_ptr<const World> world;
+    std::unique_ptr<const RoadNetwork> roads;
     bool directed=false,purposeful=false;
     std::vector<uint8_t> mask=std::vector<uint8_t>(Cells);
     std::vector<int> component=std::vector<int>(Cells,-1),jump=std::vector<int>(Cells*8,-1);
@@ -161,6 +163,7 @@ struct TrafficGraph {
     bool junction(int tile)const{return mask[tile]!=5&&mask[tile]!=10;}
     void build() {
         if(!NetworkWorker::instance().isWorkerThread())throw std::logic_error("Graph building must run on network worker");
+        roads=std::make_unique<const RoadNetwork>(*world);
         directed=purposeful||world->diagonalCount()!=0;
         for(int t=0;t<Cells;++t){mask[t]=world->connections(t%MapSize,t/MapSize);directed|=world->roadRule({t%MapSize,t/MapSize})!=0;}
         std::fill(component.begin(),component.end(),-1);componentTiles.clear();componentOffsets.clear();eligible.clear();
@@ -213,7 +216,7 @@ struct RouteSearch {
                 bool unconstrainedStart=parent[a.state]<0 && search.in<0;
                 if(!unconstrainedStart && d==oppositeDirection(in) && (network->mask[tile]&(network->mask[tile]-1)))continue;
                 int b=network->directed?((network->mask[tile]&(1<<d))?neighbor(tile,d):-1):network->jump[tile*8+d];if(b<0)continue;
-                if(network->directed && !network->world->canTravel({tile%MapSize,tile/MapSize},{b%MapSize,b/MapSize}))continue;
+                if(network->directed && !network->roads->canTravel({tile%MapSize,tile/MapSize},{b%MapSize,b/MapSize}))continue;
                 int target=search.target;
                 if(!network->directed&&manhattan(tile,target)+manhattan(target,b)==manhattan(tile,b))b=target;
                 float speed=network->world->speedLimit({b%MapSize,b/MapSize});int travel=std::max(1,int(std::lround(32.f/std::max(1.f,speed))));
@@ -704,7 +707,9 @@ struct TrafficSimulation::Impl {
         stats.active=cars.size();stats.pending=config.purposeful?requests.size()+(searching.id?1:0)+(routeJob?routeJob->pending.size():0):(config.target>cars.size()?config.target-cars.size():0);
         for(const auto& c:cars)if(c.repair)++stats.pending;
         stats.capacity=capacity;
+        stats.routeBatchAgeMs=routeJob?std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-routeJob->submitted).count():0;
         stats.memoryBytes=capacity*((FieldCount+1)*sizeof(float)+sizeof(Car)+sizeof(CarInstance)+sizeof(int))+pool.data.capacity()*sizeof(int)+network->mask.capacity();
+        if(network->roads)stats.memoryBytes+=network->roads->memoryBytes();
         for(const auto* v:std::initializer_list<const std::vector<int>*>{&slots,&freeIds,&network->component,&network->jump,&network->eligible,&network->componentTiles,&network->componentOffsets,&heads,&owner,&winner,&usedHeads,&usedWinners,&costs,&parent,&result,&tileCount,&usedTiles,&nextCandidate,&proposals,&legacyTiles})stats.memoryBytes+=v->capacity()*sizeof(int);
         stats.memoryBytes+=stamps.capacity()*sizeof(uint32_t)+detours.size()*sizeof(Path)+open.bytes();
         stats.memoryBytes+=(reserved.capacity()+exclusive.capacity())*sizeof(uint64_t)+admitted.capacity()+unreserved.capacity()+requestedMovement.capacity();

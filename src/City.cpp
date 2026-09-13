@@ -203,7 +203,12 @@ void CitySimulation::events(TrafficSimulation& traffic) {
     stats_.averageTripSeconds=stats_.completedTrips?tripSeconds_/double(stats_.completedTrips):0;
 }
 void CitySimulation::cityStep(World& w,TrafficSimulation& traffic) {
-    auto start=std::chrono::steady_clock::now();if((accessDirty_||topology_!=w.topologyRevision())&&!rebuild(w))return;
+    auto start=std::chrono::steady_clock::now(),phase=start;
+    auto mark=[&](double& total){auto now=std::chrono::steady_clock::now();total+=std::chrono::duration<double,std::milli>(now-phase).count();phase=now;};
+    bool ready=!(accessDirty_||topology_!=w.topologyRevision())||rebuild(w);
+    mark(performance_.accessMs);
+    if(!ready){++performance_.deferredSteps;return;}
+    ++performance_.steps;
     const auto second=ticks_/30;
     regionalTraffic(w,traffic);
     struct Network {std::array<int,3> capacity{};int demand=0,population=0;std::array<int,6> serviceCapacity{};};
@@ -217,6 +222,7 @@ void CitySimulation::cityStep(World& w,TrafficSimulation& traffic) {
     }
     stats_.capacity.fill(0);stats_.consumption.fill(0);
     for(const auto& n:nets)for(int i=0;i<3;++i){stats_.capacity[i]+=n.capacity[i];stats_.consumption[i]+=n.demand;}
+    mark(performance_.servicesMs);
     std::unordered_map<int,std::vector<Building*>> employers;
     for(auto& b:buildings_){b.workers=0;b.productivity=0;if(b.level&&(commercial(b.kind)||b.kind==BuildingKind::Industrial)&&b.component>=0)employers[b.component].push_back(&b);}
     std::unordered_map<int,size_t> cursor;
@@ -235,6 +241,7 @@ void CitySimulation::cityStep(World& w,TrafficSimulation& traffic) {
     stats_.demand[0]=std::clamp(0.6f+(jobs-workforce)/100.f-(taxes[0]-9)*0.08f,0.f,1.f);
     stats_.demand[1]=std::clamp(0.35f+(pop/4.f-jobs/2.f)/100.f-(taxes[1]-9)*0.08f,0.f,1.f);
     stats_.demand[2]=std::clamp(0.4f+(workforce-jobs)/100.f-(taxes[2]-9)*0.08f,0.f,1.f);
+    mark(performance_.employmentMs);
     std::fill(roadPressure_.begin(),roadPressure_.end(),0.f);
     for(const auto& car:traffic.debugSnapshot())roadPressure_[tile(car.tile)]=std::min(1.f,roadPressure_[tile(car.tile)]+0.2f+0.6f*(1-car.speed/16));
     std::map<int,Building*> passengerAccess,freightAccess;
@@ -276,6 +283,7 @@ void CitySimulation::cityStep(World& w,TrafficSimulation& traffic) {
         if(b.level==1&&b.age>120&&b.happiness>65&&b.landValue>=60&&supply>0.95f&&stats_.milestone>=2000){b.level=2;accessDirty_=true;++accessRevision_;}
     }
     updateRailServices(w);
+    mark(performance_.developmentMs);
     // Persistent sampled commuting, freight and dispatched service work.
     for(auto& h:households_)if(h.workplace&&second%60==h.id%60)sendTrip(traffic,h.home,h.workplace,0,0,h.id);
     for(auto& b:buildings_)if(b.level&&b.component>=0){
@@ -293,6 +301,7 @@ void CitySimulation::cityStep(World& w,TrafficSimulation& traffic) {
             for(auto& f:buildings_)if(f.kind==kind&&f.component==b.component&&std::min({f.utilities[0],f.utilities[1],f.utilities[2]})>0.5f&&(!best||distance(f.cell,b.cell)<distance(best->cell,b.cell)))best=&f;
             if(best){int active=0;for(auto& t:trips_)if(t.source==best->id)++active;if(active<4)sendTrip(traffic,best->id,b.id,uint8_t(2+k));}}
     }
+    mark(performance_.dispatchMs);
     stats_.population=0;stats_.jobs=0;stats_.employed=0;stats_.happiness=0;
     double income=0,expenses=w.railUpkeep()+w.roadUpkeep()+(loanTaken?250:0);
     for(const auto& b:buildings_){stats_.population+=b.residents;stats_.happiness+=b.happiness*b.residents;stats_.employed+=b.workers;
@@ -303,9 +312,19 @@ void CitySimulation::cityStep(World& w,TrafficSimulation& traffic) {
     stats_.income=income;stats_.expenses=expenses;stats_.balance=income-expenses;
     if(second%60==0&&!sandbox){treasury+=stats_.balance;if(treasury<0)++insolvency_;else insolvency_=0;if(insolvency_>=3){bankrupt=true;paused=true;}}
     for(auto& h:households_)if(auto* b=mutableFind(h.home))h.members=b->residents;
-    ++revision;publish(w);stats_.tickMs=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count();
+    mark(performance_.financeMs);
+    ++revision;publish(w);mark(performance_.publishMs);stats_.tickMs=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-start).count();
 }
-void CitySimulation::tick(World& w,TrafficSimulation& traffic){if(accessDirty_||topology_!=w.topologyRevision())rebuild(w);++ticks_;railway.tick(w,traffic);railEvents(w,traffic);traffic.tick(w);events(traffic);if(ticks_%30==0)cityStep(w,traffic);}
+void CitySimulation::tick(World& w,TrafficSimulation& traffic){
+    auto phase=std::chrono::steady_clock::now();
+    auto mark=[&](double& total){auto now=std::chrono::steady_clock::now();total+=std::chrono::duration<double,std::milli>(now-phase).count();phase=now;};
+    if(accessDirty_||topology_!=w.topologyRevision())rebuild(w);
+    mark(performance_.accessMs);++ticks_;++performance_.ticks;
+    railway.tick(w,traffic);railEvents(w,traffic);mark(performance_.railMs);
+    traffic.tick(w);mark(performance_.trafficMs);
+    events(traffic);mark(performance_.eventsMs);
+    if(ticks_%30==0)cityStep(w,traffic);
+}
 void CitySimulation::update(World& w,TrafficSimulation& traffic,double elapsed){
     if(!paused&&(accessDirty_||topology_!=w.topologyRevision()))rebuild(w);
     if(paused){accumulator_=0;refresh(w);return;}if(!std::isfinite(elapsed)||elapsed<0)return;

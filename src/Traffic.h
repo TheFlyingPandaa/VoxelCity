@@ -10,6 +10,8 @@ struct TrafficStats {
     size_t active=0, pending=0, capacity=0, memoryBytes=0;
     uint64_t completed=0, removed=0, ticks=0, routeExpansions=0;
     double tickMs=0, routingMs=0, routeLatencyMs=0;
+    // Age of the submitted worker batch, excluding requests not yet submitted.
+    double routeBatchAgeMs=0;
     uint64_t staleRoutes=0;
 };
 struct TripRequest { uint64_t id=0, owner=0; Cell from,to; uint8_t kind=0; };
